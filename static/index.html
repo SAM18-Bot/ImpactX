@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ImpactX Dashboard</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; background: #0b1220; color: #e9eefc; }
+    .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+    .card { background: #151f36; border-radius: 12px; padding: 16px; box-shadow: 0 2px 8px #0004; }
+    h1 { margin-bottom: 8px; }
+    .status { font-size: 1.2rem; font-weight: 700; padding: 4px 10px; border-radius: 8px; display: inline-block; }
+    .SAFE { background: #1f8b4c; }
+    .ALERT { background: #d99a00; }
+    .EMERGENCY { background: #c63535; }
+    .PENDING_CONFIRMATION { background: #4d6adf; }
+    .CANCELLED { background: #666; }
+    pre { white-space: pre-wrap; background: #0f1830; padding: 10px; border-radius: 8px; }
+    button { background: #4d6adf; color: white; border: 0; padding: 8px 12px; border-radius: 8px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>🚗 ImpactX Emergency Dashboard</h1>
+  <p>Perception → Decision → Coordination → Communication → Learning</p>
+
+  <div class="grid">
+    <section class="card">
+      <h2>Current Status</h2>
+      <p id="statusBadge" class="status">Loading...</p>
+      <p><strong>Score:</strong> <span id="score">-</span></p>
+      <p><strong>Location:</strong> <a id="location" href="#" target="_blank">-</a></p>
+      <p><strong>Hospital:</strong> <span id="hospital">-</span></p>
+      <p><strong>Distance:</strong> <span id="distance">-</span></p>
+      <button id="refreshBtn">Refresh</button>
+    </section>
+
+    <section class="card">
+      <h2>Agent Activity</h2>
+      <pre id="activity"></pre>
+    </section>
+
+    <section class="card">
+      <h2>Event Logs</h2>
+      <pre id="logs"></pre>
+    </section>
+  </div>
+
+  <script>
+    async function refresh() {
+      const [statusRes, logsRes] = await Promise.all([
+        fetch('/status'),
+        fetch('/logs')
+      ]);
+      const statusData = await statusRes.json();
+      const logsData = await logsRes.json();
+
+      const latest = statusData.latest || {};
+      const badge = document.getElementById('statusBadge');
+      badge.textContent = latest.status || 'NO_DATA';
+      badge.className = `status ${latest.status || ''}`;
+      document.getElementById('score').textContent = latest.score ?? '-';
+
+      const location = document.getElementById('location');
+      location.href = latest.location_link || '#';
+      location.textContent = latest.location_link || '-';
+
+      document.getElementById('hospital').textContent = latest.hospital?.hospital || '-';
+      document.getElementById('distance').textContent = latest.hospital?.distance || '-';
+
+      const activityLines = (statusData.activity || []).map(
+        a => `[${a.agent}] ${a.message} @ ${a.ts}`
+      );
+      document.getElementById('activity').textContent = activityLines.join('\n') || 'No activity yet.';
+
+      document.getElementById('logs').textContent = JSON.stringify(logsData, null, 2);
+    }
+
+    document.getElementById('refreshBtn').addEventListener('click', refresh);
+    refresh();
+    setInterval(refresh, 3000);
+  </script>
+</body>
+</html>
