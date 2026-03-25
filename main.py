@@ -149,6 +149,9 @@ def communication_agent(lat: float, lon: float, status: str) -> str:
         call_ok = make_emergency_call(lat, lon)
     mode = "real" if sms_ok or call_ok else "simulated"
     add_activity("Communication Agent", f"Alert sent ({mode}; sms={sms_ok}, call={call_ok})")
+    # Simulated SMS/Twilio action
+    print(f"[Communication Agent] SMS simulated: {msg}")
+    add_activity("Communication Agent", "Alert sent (simulated SMS)")
     return msg
 
 

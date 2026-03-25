@@ -80,6 +80,8 @@ void loop() {
 
   float lat = gps.location.lat();
   float lon = gps.location.lng();
+  float lat = gps.location.isValid() ? gps.location.lat() : 18.5204;
+  float lon = gps.location.isValid() ? gps.location.lng() : 73.8567;
   float speed = gps.speed.isValid() ? gps.speed.kmph() : 0.0;
 
   float impact = calculateImpact();
