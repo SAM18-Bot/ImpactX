@@ -29,6 +29,10 @@
       <p id="statusBadge" class="status">Loading...</p>
       <p><strong>Score:</strong> <span id="score">-</span></p>
       <p><strong>Location:</strong> <a id="location" href="#" target="_blank">-</a></p>
+      <p><strong>Your Browser Location:</strong> <span id="myLocation">Requesting permission...</span></p>
+      <p><strong>Hospital:</strong> <span id="hospital">-</span></p>
+      <p><strong>Distance:</strong> <span id="distance">-</span></p>
+      <button id="sendMyLocationEventBtn">Send Demo Event (My Location)</button>
       <p><strong>Hospital:</strong> <span id="hospital">-</span></p>
       <p><strong>Distance:</strong> <span id="distance">-</span></p>
       <button id="refreshBtn">Refresh</button>
@@ -46,6 +50,52 @@
   </div>
 
   <script>
+    let myCoords = null;
+
+    async function requestBrowserLocation() {
+      const myLocationEl = document.getElementById('myLocation');
+      if (!('geolocation' in navigator)) {
+        myLocationEl.textContent = 'Geolocation not supported in this browser.';
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          myCoords = {
+            lat: position.coords.latitude,
+            lon: position.coords.longitude
+          };
+          myLocationEl.textContent = `${myCoords.lat.toFixed(6)}, ${myCoords.lon.toFixed(6)}`;
+        },
+        (error) => {
+          myLocationEl.textContent = `Permission denied or unavailable (${error.message})`;
+        },
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 10000 }
+      );
+    }
+
+    async function sendDemoEventFromMyLocation() {
+      if (!myCoords) {
+        alert('Location not available yet. Please allow location access first.');
+        return;
+      }
+
+      const payload = {
+        impact: 8.5,
+        tilt: 60,
+        speed: 72,
+        lat: myCoords.lat,
+        lon: myCoords.lon,
+        timestamp: new Date().toISOString()
+      };
+
+      await fetch('/event', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      refresh();
+    }
+
     async function refresh() {
       const [statusRes, logsRes] = await Promise.all([
         fetch('/status'),
@@ -76,6 +126,8 @@
     }
 
     document.getElementById('refreshBtn').addEventListener('click', refresh);
+    document.getElementById('sendMyLocationEventBtn').addEventListener('click', sendDemoEventFromMyLocation);
+    requestBrowserLocation();
     refresh();
     setInterval(refresh, 3000);
   </script>

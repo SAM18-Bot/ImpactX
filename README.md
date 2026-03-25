@@ -29,6 +29,15 @@ uvicorn main:app --reload
 
 Open <http://127.0.0.1:8000> for the dashboard.
 
+### Demo with your current location
+
+1. Open the dashboard in a browser.
+2. Allow location permission when prompted.
+3. Click **Send Demo Event (My Location)**.
+4. Dashboard will post an event using your browser coordinates.
+
+> Note: Browser geolocation requires permission and may be blocked in some environments.
+
 ## Example event payload
 
 ```json
@@ -41,3 +50,22 @@ Open <http://127.0.0.1:8000> for the dashboard.
   "timestamp": "2026-03-27T10:30:00Z"
 }
 ```
+
+## Emergency SMS + Calling (Twilio)
+
+By default, this project **simulates** SMS/calls in logs for demo use.  
+To enable real communication, set these environment variables before starting FastAPI:
+
+```bash
+export ENABLE_REAL_COMMUNICATION=true
+export TWILIO_ACCOUNT_SID=ACxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+export TWILIO_AUTH_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxx
+export TWILIO_FROM_NUMBER=+1XXXXXXXXXX
+export EMERGENCY_TO_NUMBER=+1YYYYYYYYYY
+# optional for voice calls:
+export TWILIO_TWIML_URL=http://demo.twilio.com/docs/voice.xml
+```
+
+Behavior:
+- `ALERT` → sends SMS
+- `EMERGENCY` → sends SMS + places a call

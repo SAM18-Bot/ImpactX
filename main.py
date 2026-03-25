@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -140,6 +143,12 @@ def communication_agent(lat: float, lon: float, status: str) -> str:
         f"Accident detected! Status: {status}. "
         f"Location: https://maps.google.com/?q={lat},{lon}"
     )
+    sms_ok = send_sms(msg)
+    call_ok = False
+    if status == "EMERGENCY":
+        call_ok = make_emergency_call(lat, lon)
+    mode = "real" if sms_ok or call_ok else "simulated"
+    add_activity("Communication Agent", f"Alert sent ({mode}; sms={sms_ok}, call={call_ok})")
     # Simulated SMS/Twilio action
     print(f"[Communication Agent] SMS simulated: {msg}")
     add_activity("Communication Agent", "Alert sent (simulated SMS)")
@@ -151,6 +160,67 @@ def learning_agent(record: dict[str, Any]) -> None:
     with LOG_FILE.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
     add_activity("Learning Agent", f"Event {record['event_id']} stored")
+
+
+def _twilio_env_ready() -> bool:
+    required = [
+        "TWILIO_ACCOUNT_SID",
+        "TWILIO_AUTH_TOKEN",
+        "TWILIO_FROM_NUMBER",
+        "EMERGENCY_TO_NUMBER",
+    ]
+    return os.getenv("ENABLE_REAL_COMMUNICATION", "false").lower() == "true" and all(os.getenv(k) for k in required)
+
+
+def _twilio_post(path: str, data: dict[str, str]) -> bool:
+    sid = os.getenv("TWILIO_ACCOUNT_SID", "")
+    token = os.getenv("TWILIO_AUTH_TOKEN", "")
+    payload = urlencode(data).encode("utf-8")
+    req = Request(
+        f"https://api.twilio.com/2010-04-01/Accounts/{sid}/{path}.json",
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    import base64
+
+    auth = base64.b64encode(f"{sid}:{token}".encode("utf-8")).decode("utf-8")
+    req.add_header("Authorization", f"Basic {auth}")
+    try:
+        with urlopen(req, timeout=10) as resp:
+            return 200 <= resp.status < 300
+    except Exception as exc:
+        add_activity("Communication Agent", f"Twilio request failed: {exc}")
+        return False
+
+
+def send_sms(message: str) -> bool:
+    if not _twilio_env_ready():
+        print(f"[Communication Agent] SMS simulated: {message}")
+        return False
+    return _twilio_post(
+        "Messages",
+        {
+            "From": os.getenv("TWILIO_FROM_NUMBER", ""),
+            "To": os.getenv("EMERGENCY_TO_NUMBER", ""),
+            "Body": message,
+        },
+    )
+
+
+def make_emergency_call(lat: float, lon: float) -> bool:
+    if not _twilio_env_ready():
+        print(f"[Communication Agent] Emergency call simulated for {lat},{lon}")
+        return False
+    twiml_url = os.getenv("TWILIO_TWIML_URL", "http://demo.twilio.com/docs/voice.xml")
+    return _twilio_post(
+        "Calls",
+        {
+            "From": os.getenv("TWILIO_FROM_NUMBER", ""),
+            "To": os.getenv("EMERGENCY_TO_NUMBER", ""),
+            "Url": twiml_url,
+        },
+    )
 
 
 async def finalize_event_after_countdown(event_id: int, event: dict[str, Any], score: float, tentative: str) -> None:
