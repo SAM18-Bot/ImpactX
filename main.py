@@ -16,9 +16,10 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="ImpactX Emergency Response", version="1.0.0")
+app = FastAPI(title="ImpactX Emergency Response", version="1.1.0")
 
 LOG_FILE = Path("events_log.jsonl")
+CONFIRMATION_SECONDS = 20
 
 
 class SensorEvent(BaseModel):
@@ -149,9 +150,6 @@ def communication_agent(lat: float, lon: float, status: str) -> str:
         call_ok = make_emergency_call(lat, lon)
     mode = "real" if sms_ok or call_ok else "simulated"
     add_activity("Communication Agent", f"Alert sent ({mode}; sms={sms_ok}, call={call_ok})")
-    # Simulated SMS/Twilio action
-    print(f"[Communication Agent] SMS simulated: {msg}")
-    add_activity("Communication Agent", "Alert sent (simulated SMS)")
     return msg
 
 
@@ -224,8 +222,8 @@ def make_emergency_call(lat: float, lon: float) -> bool:
 
 
 async def finalize_event_after_countdown(event_id: int, event: dict[str, Any], score: float, tentative: str) -> None:
-    add_activity("Decision Agent", f"Waiting 10 seconds for user override (event {event_id})")
-    await asyncio.sleep(10)
+    add_activity("Decision Agent", f"Waiting {CONFIRMATION_SECONDS} seconds for user override (event {event_id})")
+    await asyncio.sleep(CONFIRMATION_SECONDS)
 
     latest = state.get("latest")
     if not latest or latest.get("event_id") != event_id:
