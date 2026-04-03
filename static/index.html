@@ -17,6 +17,11 @@
     .CANCELLED { background: #666; }
     pre { white-space: pre-wrap; background: #0f1830; padding: 10px; border-radius: 8px; }
     button { background: #4d6adf; color: white; border: 0; padding: 8px 12px; border-radius: 8px; cursor: pointer; }
+    .button-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    .btn-safe { background: #1f8b4c; }
+    .btn-alert { background: #d99a00; color: #111; }
+    .btn-emergency { background: #c63535; }
+    .btn-secondary { background: #33466f; }
   </style>
 </head>
 <body>
@@ -32,8 +37,16 @@
       <p><strong>Your Browser Location:</strong> <span id="myLocation">Requesting permission...</span></p>
       <p><strong>Hospital:</strong> <span id="hospital">-</span></p>
       <p><strong>Distance:</strong> <span id="distance">-</span></p>
-      <button id="sendMyLocationEventBtn">Send Demo Event (My Location)</button>
-      <button id="refreshBtn">Refresh</button>
+      <div class="button-row">
+        <button id="sendSafeBtn" class="btn-safe">Demo SAFE</button>
+        <button id="sendAlertBtn" class="btn-alert">Demo ALERT</button>
+        <button id="sendEmergencyBtn" class="btn-emergency">Demo EMERGENCY</button>
+      </div>
+      <div class="button-row">
+        <button id="sendMyLocationEventBtn" class="btn-secondary">Send Demo Event (My Location)</button>
+        <button id="refreshBtn" class="btn-secondary">Refresh</button>
+      </div>
+      <p><small>Tip: ALERT/EMERGENCY enter 20s pending-confirmation before final state.</small></p>
     </section>
 
     <section class="card">
@@ -49,6 +62,7 @@
 
   <script>
     let myCoords = null;
+    const fallbackCoords = { lat: 18.5204, lon: 73.8567 };
 
     async function requestBrowserLocation() {
       const myLocationEl = document.getElementById('myLocation');
@@ -72,17 +86,39 @@
     }
 
     async function sendDemoEventFromMyLocation() {
-      if (!myCoords) {
-        alert('Location not available yet. Please allow location access first.');
-        return;
-      }
-
+      const coords = myCoords || fallbackCoords;
       const payload = {
         impact: 8.5,
         tilt: 60,
         speed: 72,
-        lat: myCoords.lat,
-        lon: myCoords.lon,
+        lat: coords.lat,
+        lon: coords.lon,
+        timestamp: new Date().toISOString()
+      };
+
+      await fetch('/event', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      refresh();
+    }
+
+    async function sendScenarioEvent(level) {
+      const coords = myCoords || fallbackCoords;
+      const scenarios = {
+        SAFE: { impact: 2, speed: 20, tilt: 10 },          // score 9
+        ALERT: { impact: 8, speed: 60, tilt: 40 },         // score 30
+        EMERGENCY: { impact: 20, speed: 160, tilt: 90 }    // score 76
+      };
+
+      const chosen = scenarios[level];
+      const payload = {
+        impact: chosen.impact,
+        tilt: chosen.tilt,
+        speed: chosen.speed,
+        lat: coords.lat,
+        lon: coords.lon,
         timestamp: new Date().toISOString()
       };
 
@@ -125,6 +161,9 @@
 
     document.getElementById('refreshBtn').addEventListener('click', refresh);
     document.getElementById('sendMyLocationEventBtn').addEventListener('click', sendDemoEventFromMyLocation);
+    document.getElementById('sendSafeBtn').addEventListener('click', () => sendScenarioEvent('SAFE'));
+    document.getElementById('sendAlertBtn').addEventListener('click', () => sendScenarioEvent('ALERT'));
+    document.getElementById('sendEmergencyBtn').addEventListener('click', () => sendScenarioEvent('EMERGENCY'));
     requestBrowserLocation();
     refresh();
     setInterval(refresh, 3000);
