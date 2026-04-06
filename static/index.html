@@ -22,6 +22,12 @@
     .btn-alert { background: #d99a00; color: #111; }
     .btn-emergency { background: #c63535; }
     .btn-secondary { background: #33466f; }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 0.92rem; }
+    th, td { border-bottom: 1px solid #243150; padding: 8px 6px; text-align: left; }
+    th { color: #9db1e5; }
+    .muted { color: #9db1e5; }
+    .crash-image-wrap { margin-top: 8px; background: #0f1830; border-radius: 8px; padding: 8px; min-height: 140px; display: flex; align-items: center; justify-content: center; }
+    .crash-image-wrap img { max-width: 100%; max-height: 260px; border-radius: 8px; }
   </style>
 </head>
 <body>
@@ -37,6 +43,7 @@
       <p><strong>Your Browser Location:</strong> <span id="myLocation">Requesting permission...</span></p>
       <p><strong>Hospital:</strong> <span id="hospital">-</span></p>
       <p><strong>Distance:</strong> <span id="distance">-</span></p>
+      <p><strong>Event Time:</strong> <span id="eventTime">-</span></p>
       <div class="button-row">
         <button id="sendSafeBtn" class="btn-safe">Demo SAFE</button>
         <button id="sendAlertBtn" class="btn-alert">Demo ALERT</button>
@@ -50,13 +57,35 @@
     </section>
 
     <section class="card">
-      <h2>Agent Activity</h2>
-      <pre id="activity"></pre>
+      <h2>Crash Image</h2>
+      <p class="muted">Image from ESP32-CAM for the selected/latest crash event.</p>
+      <div class="crash-image-wrap">
+        <img id="crashImage" alt="Crash event image" style="display:none;" />
+        <span id="noImageMsg" class="muted">No crash image available yet.</span>
+      </div>
     </section>
 
     <section class="card">
-      <h2>Event Logs</h2>
-      <pre id="logs"></pre>
+      <h2>Crash Event History</h2>
+      <p class="muted">Recent events with time, severity score, and response info.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>Time (UTC)</th>
+            <th>Status</th>
+            <th>Score</th>
+            <th>Hospital</th>
+            <th>Distance</th>
+            <th>Image</th>
+          </tr>
+        </thead>
+        <tbody id="historyBody"></tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>Recent Agent Activity</h2>
+      <pre id="activity"></pre>
     </section>
   </div>
 
@@ -150,13 +179,36 @@
 
       document.getElementById('hospital').textContent = latest.hospital?.hospital || '-';
       document.getElementById('distance').textContent = latest.hospital?.distance || '-';
+      document.getElementById('eventTime').textContent = latest.created_at || '-';
+
+      const crashImage = document.getElementById('crashImage');
+      const noImageMsg = document.getElementById('noImageMsg');
+      if (latest.crash_image_url) {
+        crashImage.src = latest.crash_image_url;
+        crashImage.style.display = 'block';
+        noImageMsg.style.display = 'none';
+      } else {
+        crashImage.removeAttribute('src');
+        crashImage.style.display = 'none';
+        noImageMsg.style.display = 'block';
+      }
 
       const activityLines = (statusData.activity || []).map(
         a => `[${a.agent}] ${a.message} @ ${a.ts}`
       );
       document.getElementById('activity').textContent = activityLines.join('\n') || 'No activity yet.';
 
-      document.getElementById('logs').textContent = JSON.stringify(logsData, null, 2);
+      const rows = (logsData.events || []).slice().reverse().slice(0, 12).map((event) => `
+        <tr>
+          <td>${event.created_at || '-'}</td>
+          <td><span class="status ${event.status || ''}">${event.status || '-'}</span></td>
+          <td>${event.score ?? '-'}</td>
+          <td>${event.hospital?.hospital || '-'}</td>
+          <td>${event.hospital?.distance || '-'}</td>
+          <td>${event.crash_image_url ? `<a href="${event.crash_image_url}" target="_blank">View</a>` : '-'}</td>
+        </tr>
+      `).join('');
+      document.getElementById('historyBody').innerHTML = rows || '<tr><td colspan="6" class="muted">No events recorded yet.</td></tr>';
     }
 
     document.getElementById('refreshBtn').addEventListener('click', refresh);

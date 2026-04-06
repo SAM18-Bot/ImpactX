@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
+from fastapi import File, Form, UploadFile
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -19,6 +20,7 @@ from pydantic import BaseModel, Field
 app = FastAPI(title="ImpactX Emergency Response", version="1.1.0")
 
 LOG_FILE = Path("events_log.jsonl")
+CRASH_IMAGE_DIR = Path("static/crash_images")
 CONFIRMATION_SECONDS = 20
 
 
@@ -45,6 +47,7 @@ class EventResult(BaseModel):
     hospital: dict[str, Any] | None = None
     location_link: str
     created_at: str
+    crash_image_url: str | None = None
     activities: list[dict[str, str]]
 
 
@@ -221,7 +224,13 @@ def make_emergency_call(lat: float, lon: float) -> bool:
     )
 
 
-async def finalize_event_after_countdown(event_id: int, event: dict[str, Any], score: float, tentative: str) -> None:
+async def finalize_event_after_countdown(
+    event_id: int,
+    event: dict[str, Any],
+    score: float,
+    tentative: str,
+    crash_image_url: str | None = None,
+) -> None:
     add_activity("Decision Agent", f"Waiting {CONFIRMATION_SECONDS} seconds for user override (event {event_id})")
     await asyncio.sleep(CONFIRMATION_SECONDS)
 
@@ -245,6 +254,7 @@ async def finalize_event_after_countdown(event_id: int, event: dict[str, Any], s
         "hospital": hospital,
         "location_link": f"https://maps.google.com/?q={event['lat']},{event['lon']}",
         "created_at": utc_now(),
+        "crash_image_url": crash_image_url,
         "activities": list(state["activities"]),
     }
     state["latest"] = result
@@ -252,8 +262,7 @@ async def finalize_event_after_countdown(event_id: int, event: dict[str, Any], s
     learning_agent(result)
 
 
-@app.post("/event", response_model=EventResult)
-async def ingest_event(sensor_event: SensorEvent):
+async def _process_sensor_event(sensor_event: SensorEvent, crash_image_url: str | None = None) -> EventResult:
     event = perception_agent(sensor_event)
     score, status = calculate_severity(event)
 
@@ -267,6 +276,7 @@ async def ingest_event(sensor_event: SensorEvent):
         hospital=None,
         location_link=f"https://maps.google.com/?q={event['lat']},{event['lon']}",
         created_at=utc_now(),
+        crash_image_url=crash_image_url,
         activities=list(state["activities"]),
     )
 
@@ -280,8 +290,44 @@ async def ingest_event(sensor_event: SensorEvent):
         learning_agent(safe_record)
         return EventResult(**safe_record)
 
-    asyncio.create_task(finalize_event_after_countdown(event_id, event, score, status))
+    asyncio.create_task(finalize_event_after_countdown(event_id, event, score, status, crash_image_url))
     return pending_status
+
+
+@app.post("/event", response_model=EventResult)
+async def ingest_event(sensor_event: SensorEvent):
+    return await _process_sensor_event(sensor_event)
+
+
+@app.post("/event/camera", response_model=EventResult)
+async def ingest_camera_event(
+    impact: float = Form(...),
+    tilt: float = Form(...),
+    speed: float = Form(...),
+    lat: float = Form(...),
+    lon: float = Form(...),
+    timestamp: datetime = Form(...),
+    image: UploadFile = File(...),
+):
+    CRASH_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+    ext = Path(image.filename or "crash.jpg").suffix or ".jpg"
+    filename = f"crash_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}{ext}"
+    target = CRASH_IMAGE_DIR / filename
+    content = await image.read()
+    target.write_bytes(content)
+
+    crash_url = f"/static/crash_images/{filename}"
+    add_activity("Perception Agent", f"Crash image stored: {filename}")
+    event_model = SensorEvent(
+        impact=impact,
+        tilt=tilt,
+        speed=speed,
+        lat=lat,
+        lon=lon,
+        timestamp=timestamp,
+    )
+    return await _process_sensor_event(event_model, crash_image_url=crash_url)
 
 
 @app.post("/event/{event_id}/cancel")
