@@ -1,37 +1,84 @@
-# ImpactX – Autonomous Emergency Response Agent
+# ImpactX
 
-ImpactX now uses a **hybrid fail-safe architecture (Edge + Cloud)** so critical emergency actions can still happen when internet or backend services fail.
+ImpactX is an emergency response system that combines an edge device (ESP32 + sensors + GPS) with a FastAPI backend and web dashboard.
 
-## Hybrid Architecture (Dual Decision System)
+The ESP32 sends telemetry to the backend, and the backend handles severity decisions, logging, and optional Twilio notifications.
 
-- **Edge Layer (ESP32 + sensors + SIM800L)**
-  - Performs immediate local severity estimation.
-  - Starts a **20-second physical cancel window** using a hardware button.
-  - If not cancelled, triggers local emergency actions (buzzer + LED + GSM SMS).
-  - Retries cloud delivery and buffers unsent GSM alerts for eventual retry.
-- **Cloud Layer (FastAPI multi-agent backend)**
-  - Runs advanced workflow, activity feed, event logging, dashboard visibility, hospital lookup, and optional Twilio comms.
+## Key Features
 
-This means the system is **fail-safe, not cloud-dependent** for life-critical response.
+- ESP32 + FastAPI architecture for live incident telemetry.
+- Real-time severity classification: `SAFE`, `ALERT`, `EMERGENCY`.
+- 20-second confirmation window before escalation.
+- Local emergency indication on device (buzzer, LED).
+- Dashboard for live status, activity feed, and event logs.
+- Optional Twilio integration for cloud SMS/call workflows.
 
-## Agent Design (Cloud)
+## Architecture
 
-- **Perception Agent**: validates + normalizes incoming sensor payloads.
-- **Decision Agent**: computes severity score and classifies `SAFE`/`ALERT`/`EMERGENCY`.
-- **Coordination Agent**: finds nearest hospital (mock dataset).
-- **Communication Agent**: sends Twilio SMS/call or simulates in demo mode.
-- **Learning Agent**: persists finalized events into `events_log.jsonl`.
+### Edge Layer (ESP32 + MPU6050 + GPS)
 
-## API
+- Reads telemetry and computes local severity.
+- Attempts delivery to backend.
+- Starts physical cancel window.
+- Triggers local emergency outputs when required.
 
-- `POST /event` – receive telemetry and trigger workflow.
-- `POST /event/{event_id}/cancel` – cloud-side manual override during pending state.
-- `GET /status` – latest state + recent agent activity.
-- `GET /logs` – event history.
-- `GET /health` – liveness probe.
-- `GET /` – web dashboard.
+### Cloud Layer (FastAPI)
 
-## Run (Backend)
+- Validates and normalizes incoming events.
+- Computes severity and manages event state transitions.
+- Resolves nearest hospital from a demo dataset.
+- Sends communication actions (simulated or Twilio-backed).
+- Persists event records for audit/history.
+
+## Project Workflow
+
+### 1) Data Ingestion
+- Hardware mode: ESP32 sends sensor payloads to `POST /event`.
+- Demo mode: dashboard buttons submit predefined `SAFE`, `ALERT`, or `EMERGENCY` payloads to `POST /event`.
+
+### 2) Perception + Decision
+- Backend normalizes telemetry and computes severity score:
+  - `SAFE` if score `< 30`
+  - `ALERT` if score `30–70`
+  - `EMERGENCY` if score `> 70`
+
+### 3) Confirmation Window
+- `ALERT` and `EMERGENCY` first enter `PENDING_CONFIRMATION`.
+- System waits 20 seconds for manual cancel via `POST /event/{event_id}/cancel`.
+
+### 4) Escalation Path
+- If cancelled: status becomes `CANCELLED`.
+- If not cancelled:
+  - `ALERT` → hospital lookup + SMS flow.
+  - `EMERGENCY` → hospital lookup + SMS + voice call flow.
+
+### 5) Communication Behavior
+- Default behavior is simulated communication (safe for local demos).
+- Real delivery is enabled only when `ENABLE_REAL_COMMUNICATION=true` and Twilio environment variables are configured.
+
+### 6) Persistence + Monitoring
+- Finalized events are appended to `events_log.jsonl`.
+- Dashboard polls:
+  - `GET /status` for latest state and recent activity.
+  - `GET /logs` for full event history.
+
+## Repository Structure
+
+- `main.py` — FastAPI backend and agent workflow.
+- `static/index.html` — dashboard UI.
+- `iot/esp32_sender.ino` — ESP32 firmware logic.
+- `events_log.jsonl` — runtime event log output.
+
+## API Endpoints
+
+- `POST /event` — ingest telemetry event.
+- `POST /event/{event_id}/cancel` — cancel pending event.
+- `GET /status` — latest status and recent activity.
+- `GET /logs` — event history.
+- `GET /health` — service health check.
+- `GET /` — dashboard page.
+
+## Local Setup
 
 ```bash
 python -m venv .venv
@@ -40,31 +87,59 @@ pip install -r requirements.txt
 uvicorn main:app --reload
 ```
 
-Open <http://127.0.0.1:8000> for the dashboard.
+Dashboard: <http://127.0.0.1:8000>
 
-## Edge Fail-Safe Behavior (ESP32)
+## Connect ESP32 to Backend (Receive Live Hardware Data)
 
-When crash score crosses threshold, ESP32 now does all of this locally:
+1. **Run backend on a reachable network interface**
+   ```bash
+   uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+   ```
 
-1. Retry sending event to backend (up to 5 times).
-2. If backend unreachable, switch to **offline edge mode**.
-3. Start **20-second countdown**.
-4. Allow user to cancel with **physical button** on device.
-5. If not cancelled, trigger **buzzer + LED + GSM SMS**.
-6. If GSM send fails, keep message in buffer and retry later.
+2. **Find your laptop/PC LAN IP**
+   - Example: `192.168.1.23`
+   - ESP32 and laptop must be on the same Wi-Fi network.
 
-## Dashboard Demo
+3. **Update ESP32 firmware config in `iot/esp32_sender.ino`**
+   ```cpp
+   const char* WIFI_SSID = "YOUR_WIFI";
+   const char* WIFI_PASS = "YOUR_PASS";
+   const char* API_URL = "http://192.168.1.23:8000/event";
+   ```
+   Use your actual LAN IP in `API_URL` (not `127.0.0.1`).
 
-1. Open dashboard in browser.
-2. Allow geolocation permission.
-3. Click **Send Demo Event (My Location)**.
-4. Watch status + activity feed update.
+4. **Flash ESP32 and open Serial Monitor (115200)**
+   - On successful posts you should see: `POST /event try X => 200`.
+   - If backend is unreachable, device retries and logs POST failures in Serial Monitor.
 
-> Browser geolocation depends on permission and browser support.
+5. **Verify data in backend dashboard**
+   - Open: `http://<your-laptop-ip>:8000` (or `http://127.0.0.1:8000` on same machine).
+   - Check `GET /status` and `GET /logs` for incoming events.
 
-## Twilio (Optional Cloud Comms)
+### Quick troubleshooting
+- `POST ... => -1` or timeout: wrong `API_URL`, network mismatch, or firewall blocking port `8000`.
+- No Wi-Fi connect on ESP32: wrong SSID/password or unsupported band (use 2.4 GHz).
+- Dashboard opens but no events: ensure sensor score crosses threshold so firmware sends `/event`.
 
-By default, backend comms are simulated for demo.
+## Dashboard Demo (No Hardware Required)
+
+The dashboard supports manual simulation buttons:
+
+- `Demo SAFE`
+- `Demo ALERT`
+- `Demo EMERGENCY`
+
+You can also submit a location-based sample event using `Send Demo Event (My Location)`.
+
+## Twilio Integration (Optional)
+
+By default, communication actions are simulated.
+
+### Where to add Twilio credentials
+
+Set these environment variables in the same terminal/session where you start the FastAPI server (`uvicorn main:app --reload`), or configure them in your deployment platform's environment settings.
+
+Enable real Twilio delivery:
 
 ```bash
 export ENABLE_REAL_COMMUNICATION=true
@@ -75,6 +150,28 @@ export EMERGENCY_TO_NUMBER=+1YYYYYYYYYY
 export TWILIO_TWIML_URL=http://demo.twilio.com/docs/voice.xml
 ```
 
-Behavior:
+### What ImpactX sends through Twilio
+
+- `SAFE`:
+  - No Twilio SMS or call is sent.
+- `ALERT`:
+  - Sends one SMS to `EMERGENCY_TO_NUMBER`.
+- `EMERGENCY`:
+  - Sends one SMS to `EMERGENCY_TO_NUMBER`.
+  - Places one voice call to `EMERGENCY_TO_NUMBER`.
+
+Current SMS body format:
+
+```text
+Accident detected! Status: <ALERT|EMERGENCY>. Location: https://maps.google.com/?q=<lat>,<lon>
+```
+
+Current voice call behavior:
+
+- Uses Twilio `Calls` API from `TWILIO_FROM_NUMBER` to `EMERGENCY_TO_NUMBER`.
+- Plays TwiML from `TWILIO_TWIML_URL` (defaults to Twilio demo URL if not set).
+
+Delivery behavior:
+
 - `ALERT` → SMS
-- `EMERGENCY` → SMS + call
+- `EMERGENCY` → SMS + voice call

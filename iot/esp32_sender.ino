@@ -22,28 +22,19 @@ const int ALERT_LED_PIN = 2;
 TinyGPSPlus gps;
 HardwareSerial gpsSerial(1);       // RX=16 TX=17
 
-// ---------- GSM (SIM800L) ----------
-HardwareSerial gsmSerial(2);       // RX=27 TX=14
-const char* EMERGENCY_NUMBER = "+1YYYYYYYYYY";
-
-// ---------- Edge decision + fallback ----------
+// ---------- Edge decision ----------
 const float EDGE_ALERT_THRESHOLD = 30.0;
 const float EDGE_EMERGENCY_THRESHOLD = 70.0;
 const unsigned long CONFIRM_MS = 20000; // 20 seconds
 const int BACKEND_RETRIES = 5;
-const int GSM_RETRIES = 3;
 
 bool incidentPending = false;
-bool offlineMode = false;
 unsigned long pendingSince = 0;
 float pendingImpact = 0;
 float pendingTilt = 0;
 float pendingSpeed = 0;
 float pendingLat = 0;
 float pendingLon = 0;
-
-String smsBuffer[5];
-int smsBufferCount = 0;
 
 void setupMPU() {
   Wire.begin();
@@ -91,10 +82,8 @@ void connectWiFi() {
   }
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\nWiFi connected");
-    offlineMode = false;
   } else {
-    Serial.println("\nWiFi unavailable -> edge offline mode");
-    offlineMode = true;
+    Serial.println("\nWiFi unavailable");
   }
 }
 
@@ -140,62 +129,10 @@ bool sendEventToBackend(float impact, float tilt, float speed, float lat, float 
   return false;
 }
 
-void addSmsToBuffer(const String& msg) {
-  if (smsBufferCount < 5) {
-    smsBuffer[smsBufferCount++] = msg;
-  }
-}
-
-bool gsmCommand(const String& cmd, const String& expect, int timeoutMs) {
-  gsmSerial.println(cmd);
-  String rx = "";
-  unsigned long start = millis();
-  while (millis() - start < (unsigned long)timeoutMs) {
-    while (gsmSerial.available()) {
-      rx += (char)gsmSerial.read();
-    }
-    if (rx.indexOf(expect) >= 0) return true;
-  }
-  return false;
-}
-
-bool sendSmsGsm(const String& message) {
-  for (int i = 0; i < GSM_RETRIES; i++) {
-    if (!gsmCommand("AT", "OK", 1200)) continue;
-    if (!gsmCommand("AT+CMGF=1", "OK", 1200)) continue;
-    gsmSerial.print("AT+CMGS=\"");
-    gsmSerial.print(EMERGENCY_NUMBER);
-    gsmSerial.println("\"");
-    delay(500);
-    gsmSerial.print(message);
-    gsmSerial.write(26); // Ctrl+Z
-    if (gsmCommand("", "OK", 7000) || gsmCommand("", "+CMGS", 7000)) {
-      return true;
-    }
-  }
-  return false;
-}
-
-void flushSmsBuffer() {
-  int i = 0;
-  while (i < smsBufferCount) {
-    if (sendSmsGsm(smsBuffer[i])) {
-      for (int j = i; j < smsBufferCount - 1; j++) smsBuffer[j] = smsBuffer[j + 1];
-      smsBufferCount--;
-    } else {
-      break;
-    }
-  }
-}
-
 void triggerLocalAlert(const String& msg) {
   digitalWrite(ALERT_LED_PIN, HIGH);
   tone(BUZZER_PIN, 1800, 600);
-
-  if (!sendSmsGsm(msg)) {
-    addSmsToBuffer(msg);
-    Serial.println("GSM send failed, buffered for retry");
-  }
+  Serial.println(msg);
 }
 
 void startPendingIncident(float impact, float tilt, float speed, float lat, float lon) {
@@ -218,7 +155,6 @@ void setup() {
 
   setupMPU();
   gpsSerial.begin(9600, SERIAL_8N1, 16, 17);
-  gsmSerial.begin(9600, SERIAL_8N1, 27, 14);
 
   connectWiFi();
 }
@@ -226,10 +162,6 @@ void setup() {
 void loop() {
   while (gpsSerial.available() > 0) {
     gps.encode(gpsSerial.read());
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    offlineMode = true;
   }
 
   readMPU();
@@ -244,9 +176,8 @@ void loop() {
       float lon = gps.location.isValid() ? gps.location.lng() : 0.0;
 
       bool delivered = sendEventToBackend(impact, tilt, speed, lat, lon);
-      offlineMode = !delivered;
       if (!delivered) {
-        Serial.println("Backend unavailable after retries -> offline edge mode active.");
+        Serial.println("Backend unavailable after retries.");
       }
 
       startPendingIncident(impact, tilt, speed, lat, lon);
@@ -270,7 +201,5 @@ void loop() {
       Serial.println("No cancel in 20s -> local emergency response triggered.");
     }
   }
-
-  flushSmsBuffer();
   delay(300);
 }
