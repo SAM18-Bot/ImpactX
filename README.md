@@ -1,28 +1,26 @@
 # ImpactX
 
-ImpactX is a hybrid emergency response system that combines an edge device (ESP32 + sensors + GSM) with a FastAPI backend and web dashboard.
+ImpactX is an emergency response system that combines an edge device (ESP32 + sensors + GPS) with a FastAPI backend and web dashboard.
 
-The design prioritizes reliability: critical emergency actions can still execute at the edge even when cloud connectivity is unavailable.
+The ESP32 sends telemetry to the backend, and the backend handles severity decisions, logging, and optional Twilio notifications.
 
 ## Key Features
 
-- Hybrid edge/cloud architecture with fail-safe behavior.
+- ESP32 + FastAPI architecture for live incident telemetry.
 - Real-time severity classification: `SAFE`, `ALERT`, `EMERGENCY`.
 - 20-second confirmation window before escalation.
-- Local emergency handling on device (buzzer, LED, GSM SMS).
+- Local emergency indication on device (buzzer, LED).
 - Dashboard for live status, activity feed, and event logs.
 - Optional Twilio integration for cloud SMS/call workflows.
 
 ## Architecture
 
-### Edge Layer (ESP32 + MPU6050 + GPS + SIM800L)
+### Edge Layer (ESP32 + MPU6050 + GPS)
 
 - Reads telemetry and computes local severity.
 - Attempts delivery to backend.
-- If backend is unavailable, continues in offline mode.
 - Starts physical cancel window.
-- Triggers local emergency outputs and GSM notification when required.
-- Buffers failed GSM sends for retry.
+- Triggers local emergency outputs when required.
 
 ### Cloud Layer (FastAPI)
 
@@ -31,6 +29,38 @@ The design prioritizes reliability: critical emergency actions can still execute
 - Resolves nearest hospital from a demo dataset.
 - Sends communication actions (simulated or Twilio-backed).
 - Persists event records for audit/history.
+
+## Project Workflow
+
+### 1) Data Ingestion
+- Hardware mode: ESP32 sends sensor payloads to `POST /event`.
+- Demo mode: dashboard buttons submit predefined `SAFE`, `ALERT`, or `EMERGENCY` payloads to `POST /event`.
+
+### 2) Perception + Decision
+- Backend normalizes telemetry and computes severity score:
+  - `SAFE` if score `< 30`
+  - `ALERT` if score `30–70`
+  - `EMERGENCY` if score `> 70`
+
+### 3) Confirmation Window
+- `ALERT` and `EMERGENCY` first enter `PENDING_CONFIRMATION`.
+- System waits 20 seconds for manual cancel via `POST /event/{event_id}/cancel`.
+
+### 4) Escalation Path
+- If cancelled: status becomes `CANCELLED`.
+- If not cancelled:
+  - `ALERT` → hospital lookup + SMS flow.
+  - `EMERGENCY` → hospital lookup + SMS + voice call flow.
+
+### 5) Communication Behavior
+- Default behavior is simulated communication (safe for local demos).
+- Real delivery is enabled only when `ENABLE_REAL_COMMUNICATION=true` and Twilio environment variables are configured.
+
+### 6) Persistence + Monitoring
+- Finalized events are appended to `events_log.jsonl`.
+- Dashboard polls:
+  - `GET /status` for latest state and recent activity.
+  - `GET /logs` for full event history.
 
 ## Repository Structure
 
@@ -59,6 +89,38 @@ uvicorn main:app --reload
 
 Dashboard: <http://127.0.0.1:8000>
 
+## Connect ESP32 to Backend (Receive Live Hardware Data)
+
+1. **Run backend on a reachable network interface**
+   ```bash
+   uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+   ```
+
+2. **Find your laptop/PC LAN IP**
+   - Example: `192.168.1.23`
+   - ESP32 and laptop must be on the same Wi-Fi network.
+
+3. **Update ESP32 firmware config in `iot/esp32_sender.ino`**
+   ```cpp
+   const char* WIFI_SSID = "YOUR_WIFI";
+   const char* WIFI_PASS = "YOUR_PASS";
+   const char* API_URL = "http://192.168.1.23:8000/event";
+   ```
+   Use your actual LAN IP in `API_URL` (not `127.0.0.1`).
+
+4. **Flash ESP32 and open Serial Monitor (115200)**
+   - On successful posts you should see: `POST /event try X => 200`.
+   - If backend is unreachable, device retries and logs POST failures in Serial Monitor.
+
+5. **Verify data in backend dashboard**
+   - Open: `http://<your-laptop-ip>:8000` (or `http://127.0.0.1:8000` on same machine).
+   - Check `GET /status` and `GET /logs` for incoming events.
+
+### Quick troubleshooting
+- `POST ... => -1` or timeout: wrong `API_URL`, network mismatch, or firewall blocking port `8000`.
+- No Wi-Fi connect on ESP32: wrong SSID/password or unsupported band (use 2.4 GHz).
+- Dashboard opens but no events: ensure sensor score crosses threshold so firmware sends `/event`.
+
 ## Dashboard Demo (No Hardware Required)
 
 The dashboard supports manual simulation buttons:
@@ -73,6 +135,10 @@ You can also submit a location-based sample event using `Send Demo Event (My Loc
 
 By default, communication actions are simulated.
 
+### Where to add Twilio credentials
+
+Set these environment variables in the same terminal/session where you start the FastAPI server (`uvicorn main:app --reload`), or configure them in your deployment platform's environment settings.
+
 Enable real Twilio delivery:
 
 ```bash
@@ -83,6 +149,27 @@ export TWILIO_FROM_NUMBER=+1XXXXXXXXXX
 export EMERGENCY_TO_NUMBER=+1YYYYYYYYYY
 export TWILIO_TWIML_URL=http://demo.twilio.com/docs/voice.xml
 ```
+
+### What ImpactX sends through Twilio
+
+- `SAFE`:
+  - No Twilio SMS or call is sent.
+- `ALERT`:
+  - Sends one SMS to `EMERGENCY_TO_NUMBER`.
+- `EMERGENCY`:
+  - Sends one SMS to `EMERGENCY_TO_NUMBER`.
+  - Places one voice call to `EMERGENCY_TO_NUMBER`.
+
+Current SMS body format:
+
+```text
+Accident detected! Status: <ALERT|EMERGENCY>. Location: https://maps.google.com/?q=<lat>,<lon>
+```
+
+Current voice call behavior:
+
+- Uses Twilio `Calls` API from `TWILIO_FROM_NUMBER` to `EMERGENCY_TO_NUMBER`.
+- Plays TwiML from `TWILIO_TWIML_URL` (defaults to Twilio demo URL if not set).
 
 Delivery behavior:
 
