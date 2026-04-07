@@ -46,9 +46,9 @@ The ESP32 sends telemetry to the backend, and the backend handles severity decis
   - `risk_score = impact_score*0.55 + speed_score*0.30 + tilt_score*0.15`
   - low-speed suppression (`speed < 12 && impact < 7`) applies `risk_score *= 0.65`
 - Classification (adaptive):
-  - `SAFE` if `risk_score < (42 + shift)`
-  - `ALERT` if `42 + shift <= risk_score <= 72 + shift`
-  - `EMERGENCY` if `risk_score > 72 + shift`
+  - `SAFE` if `risk_score < (20 + shift)`
+  - `ALERT` if `20 + shift <= risk_score <= 50 + shift`
+  - `EMERGENCY` if `risk_score > 50 + shift`
 - `shift` is learned online from false-alarm ratio (cancelled incidents).
 
 ### 3) Confirmation Window
@@ -131,6 +131,7 @@ Dashboard: <http://127.0.0.1:8000>
 - `POST ... => -1` or timeout: wrong `API_URL`, network mismatch, or firewall blocking port `8000`.
 - No Wi-Fi connect on ESP32: wrong SSID/password or unsupported band (use 2.4 GHz).
 - Dashboard opens but no events: ensure sensor score crosses threshold so firmware sends `/event/camera`.
+- Firmware sends only high-impact candidates (`impact > 20`) to reduce low-impact network noise.
 
 ## Dashboard Demo (No Hardware Required)
 

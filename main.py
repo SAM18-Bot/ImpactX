@@ -157,8 +157,8 @@ def calculate_severity(event: dict[str, Any]) -> tuple[float, str]:
         score *= 0.65
 
     shift = float(state["learning"].get("threshold_shift", 0.0))
-    alert_threshold = 42 + shift
-    emergency_threshold = 72 + shift
+    alert_threshold = 20 + shift
+    emergency_threshold = 50 + shift
     if score < alert_threshold:
         status = "SAFE"
     elif score <= emergency_threshold:

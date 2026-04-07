@@ -25,8 +25,8 @@ TinyGPSPlus gps;
 HardwareSerial gpsSerial(1);       // RX=16 TX=17
 
 // ---------- Edge decision ----------
-const float EDGE_ALERT_THRESHOLD = 30.0;
-const float EDGE_EMERGENCY_THRESHOLD = 70.0;
+const float EDGE_ALERT_THRESHOLD = 20.0;
+const float EDGE_EMERGENCY_THRESHOLD = 50.0;
 const unsigned long CONFIRM_MS = 20000; // 20 seconds
 const int BACKEND_RETRIES = 5;
 
@@ -266,7 +266,7 @@ void loop() {
 
   if (!incidentPending) {
     float score = calculateSeverity(impact, speed, tilt);
-    if (score >= EDGE_ALERT_THRESHOLD) {
+    if (impact > 20.0 && score >= EDGE_ALERT_THRESHOLD) {
       float lat = gps.location.isValid() ? gps.location.lat() : 0.0;
       float lon = gps.location.isValid() ? gps.location.lng() : 0.0;
 
