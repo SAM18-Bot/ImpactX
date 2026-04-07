@@ -28,6 +28,10 @@
     .muted { color: #9db1e5; }
     .crash-image-wrap { margin-top: 8px; background: #0f1830; border-radius: 8px; padding: 8px; min-height: 140px; display: flex; align-items: center; justify-content: center; }
     .crash-image-wrap img { max-width: 100%; max-height: 260px; border-radius: 8px; }
+    .hw { display: flex; gap: 10px; align-items: center; margin-top: 8px; }
+    .led { width: 16px; height: 16px; border-radius: 50%; background: #333; box-shadow: inset 0 0 4px #000; }
+    .led.green.on { background: #35d06f; box-shadow: 0 0 10px #35d06f; }
+    .led.red.on { background: #f33; box-shadow: 0 0 10px #f33; }
   </style>
 </head>
 <body>
@@ -54,6 +58,11 @@
         <button id="refreshBtn" class="btn-secondary">Refresh</button>
       </div>
       <p><small>Tip: ALERT/EMERGENCY enter 20s pending-confirmation before final state.</small></p>
+      <div class="hw">
+        <span>Green LED</span><span id="greenLed" class="led green on"></span>
+        <span>Red LED</span><span id="redLed" class="led red"></span>
+        <span id="buzzerState" class="muted">Buzzer: OFF</span>
+      </div>
     </section>
 
     <section class="card">
@@ -67,7 +76,7 @@
 
     <section class="card">
       <h2>Crash Event History</h2>
-      <p class="muted">Recent events with time, severity score, and response info.</p>
+      <p class="muted">Recent ALERT/EMERGENCY events only.</p>
       <table>
         <thead>
           <tr>
@@ -91,6 +100,7 @@
 
   <script>
     let myCoords = null;
+    let lastHardwareStatus = null;
     const fallbackCoords = { lat: 18.5204, lon: 73.8567 };
 
     async function requestBrowserLocation() {
@@ -136,9 +146,9 @@
     async function sendScenarioEvent(level) {
       const coords = myCoords || fallbackCoords;
       const scenarios = {
-        SAFE: { impact: 2, speed: 20, tilt: 10 },          // score 9
-        ALERT: { impact: 8, speed: 60, tilt: 40 },         // score 30
-        EMERGENCY: { impact: 20, speed: 160, tilt: 90 }    // score 76
+        SAFE: { impact: 3, speed: 15, tilt: 8 },           // expected < 20
+        ALERT: { impact: 6, speed: 35, tilt: 25 },         // expected 20-50
+        EMERGENCY: { impact: 12, speed: 80, tilt: 60 }     // expected > 50
       };
 
       const chosen = scenarios[level];
@@ -168,6 +178,7 @@
       const logsData = await logsRes.json();
 
       const latest = statusData.latest || {};
+      applyHardwareSimulation(latest.status || 'NO_DATA');
       const badge = document.getElementById('statusBadge');
       badge.textContent = latest.status || 'NO_DATA';
       badge.className = `status ${latest.status || ''}`;
@@ -198,7 +209,9 @@
       );
       document.getElementById('activity').textContent = activityLines.join('\n') || 'No activity yet.';
 
-      const rows = (logsData.events || []).slice().reverse().slice(0, 12).map((event) => `
+      const rows = (logsData.events || [])
+        .filter(event => event.status === 'ALERT' || event.status === 'EMERGENCY')
+        .slice().reverse().slice(0, 12).map((event) => `
         <tr>
           <td>${event.created_at || '-'}</td>
           <td><span class="status ${event.status || ''}">${event.status || '-'}</span></td>
@@ -209,6 +222,40 @@
         </tr>
       `).join('');
       document.getElementById('historyBody').innerHTML = rows || '<tr><td colspan="6" class="muted">No events recorded yet.</td></tr>';
+    }
+
+    function beep() {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'square';
+      osc.frequency.value = 1700;
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      gain.gain.value = 0.04;
+      osc.start();
+      setTimeout(() => {
+        osc.stop();
+        ctx.close();
+      }, 400);
+    }
+
+    function applyHardwareSimulation(status) {
+      const red = document.getElementById('redLed');
+      const buzzer = document.getElementById('buzzerState');
+      if (status === 'ALERT' || status === 'EMERGENCY' || status === 'PENDING_CONFIRMATION') {
+        red.classList.add('on');
+        buzzer.textContent = 'Buzzer: ON';
+        if (status !== lastHardwareStatus) {
+          beep();
+        }
+      } else {
+        red.classList.remove('on');
+        buzzer.textContent = 'Buzzer: OFF';
+      }
+      lastHardwareStatus = status;
     }
 
     document.getElementById('refreshBtn').addEventListener('click', refresh);

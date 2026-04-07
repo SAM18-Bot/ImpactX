@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 app = FastAPI(title="ImpactX Emergency Response", version="1.1.0")
 
 LOG_FILE = Path("events_log.jsonl")
+LEARNING_FILE = Path("learning_profile.json")
 CRASH_IMAGE_DIR = Path("static/crash_images")
 CONFIRMATION_SECONDS = 20
 
@@ -56,6 +57,7 @@ state: dict[str, Any] = {
     "logs": [],
     "activities": [],
     "next_id": 1,
+    "learning": {"false_alarm_count": 0, "confirmed_count": 0, "threshold_shift": 0.0},
 }
 
 
@@ -69,6 +71,50 @@ def add_activity(agent: str, message: str) -> AgentActivity:
     # Keep recent activity only for dashboard readability
     state["activities"] = state["activities"][-50:]
     return activity
+
+
+def _load_learning_profile() -> None:
+    if not LEARNING_FILE.exists():
+        return
+    try:
+        data = json.loads(LEARNING_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            state["learning"].update(
+                {
+                    "false_alarm_count": int(data.get("false_alarm_count", 0)),
+                    "confirmed_count": int(data.get("confirmed_count", 0)),
+                    "threshold_shift": float(data.get("threshold_shift", 0.0)),
+                }
+            )
+    except Exception as exc:
+        add_activity("Learning Agent", f"Profile load failed: {exc}")
+
+
+def _save_learning_profile() -> None:
+    LEARNING_FILE.write_text(json.dumps(state["learning"], indent=2), encoding="utf-8")
+
+
+def _update_learning(cancelled: bool) -> None:
+    if cancelled:
+        state["learning"]["false_alarm_count"] += 1
+    else:
+        state["learning"]["confirmed_count"] += 1
+
+    false_alarms = state["learning"]["false_alarm_count"]
+    confirmed = state["learning"]["confirmed_count"]
+    total = max(false_alarms + confirmed, 1)
+    false_alarm_rate = false_alarms / total
+
+    # Online threshold adaptation:
+    # More false alarms => increase threshold slightly.
+    # Strong confirmations => reduce threshold slightly.
+    shift = round(max(-6.0, min(12.0, (false_alarm_rate - 0.25) * 20.0)), 2)
+    state["learning"]["threshold_shift"] = shift
+    _save_learning_profile()
+    add_activity(
+        "Learning Agent",
+        f"Adaptive threshold shift updated to {shift:+.2f} (false alarm rate={false_alarm_rate:.2%})",
+    )
 
 
 # -----------------------------
@@ -97,14 +143,35 @@ def perception_agent(raw: SensorEvent) -> dict[str, Any]:
 
 
 def calculate_severity(event: dict[str, Any]) -> tuple[float, str]:
-    score = (event["impact"] * 0.5) + (event["speed"] * 0.3) + (event["tilt"] * 0.2)
-    if score < 30:
+    # Real-world oriented risk formula:
+    # - impact dominates (sudden g-force)
+    # - speed contributes kinetic risk (normalized)
+    # - tilt indicates rollover likelihood
+    # - low speed + high impact often means pothole/phone drop (false alarm control)
+    impact_score = min(100.0, event["impact"] * 6.5)
+    speed_score = min(100.0, (event["speed"] / 140.0) * 100.0)
+    tilt_score = min(100.0, (event["tilt"] / 90.0) * 100.0)
+
+    score = (impact_score * 0.55) + (speed_score * 0.30) + (tilt_score * 0.15)
+    if event["speed"] < 12 and event["impact"] < 7:
+        score *= 0.65
+
+    shift = float(state["learning"].get("threshold_shift", 0.0))
+    alert_threshold = 20 + shift
+    emergency_threshold = 50 + shift
+    if score < alert_threshold:
         status = "SAFE"
-    elif score <= 70:
+    elif score <= emergency_threshold:
         status = "ALERT"
     else:
         status = "EMERGENCY"
-    add_activity("Decision Agent", f"Score computed: {score:.2f}, status={status}")
+    add_activity(
+        "Decision Agent",
+        (
+            f"Score={score:.2f}, status={status}, "
+            f"thresholds(alert={alert_threshold:.2f}, emergency={emergency_threshold:.2f})"
+        ),
+    )
     return round(score, 2), status
 
 
@@ -260,6 +327,7 @@ async def finalize_event_after_countdown(
     state["latest"] = result
     state["logs"].append(result)
     learning_agent(result)
+    _update_learning(cancelled=False)
 
 
 async def _process_sensor_event(sensor_event: SensorEvent, crash_image_url: str | None = None) -> EventResult:
@@ -341,6 +409,7 @@ async def cancel_event(event_id: int):
     latest["status"] = "CANCELLED"
     state["logs"].append(dict(latest))
     learning_agent(dict(latest))
+    _update_learning(cancelled=True)
     return {"ok": True, "event_id": event_id, "status": "CANCELLED"}
 
 
@@ -372,3 +441,6 @@ def dashboard():
     if dashboard_file.exists():
         return dashboard_file.read_text(encoding="utf-8")
     return "<h1>ImpactX Dashboard not found</h1>"
+
+
+_load_learning_profile()
