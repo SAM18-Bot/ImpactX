@@ -67,7 +67,7 @@
 
     <section class="card">
       <h2>Crash Event History</h2>
-      <p class="muted">Recent events with time, severity score, and response info.</p>
+      <p class="muted">Recent ALERT/EMERGENCY events only.</p>
       <table>
         <thead>
           <tr>
@@ -198,7 +198,9 @@
       );
       document.getElementById('activity').textContent = activityLines.join('\n') || 'No activity yet.';
 
-      const rows = (logsData.events || []).slice().reverse().slice(0, 12).map((event) => `
+      const rows = (logsData.events || [])
+        .filter(event => event.status === 'ALERT' || event.status === 'EMERGENCY')
+        .slice().reverse().slice(0, 12).map((event) => `
         <tr>
           <td>${event.created_at || '-'}</td>
           <td><span class="status ${event.status || ''}">${event.status || '-'}</span></td>
