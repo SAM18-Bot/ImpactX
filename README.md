@@ -9,9 +9,11 @@ The ESP32 sends telemetry to the backend, and the backend handles severity decis
 - ESP32 + FastAPI architecture for live incident telemetry.
 - Real-time severity classification: `SAFE`, `ALERT`, `EMERGENCY`.
 - 20-second confirmation window before escalation.
-- Local emergency indication on device (buzzer, LED).
+- ESP32-CAM uploads crash image + sensor/GPS bundle in one request.
+- Local emergency indication on device (red LED + buzzer) with green LED always on.
 - Dashboard for live status, activity feed, and event logs.
 - Optional Twilio integration for cloud SMS/call workflows.
+- Online learning from cancelled incidents (false alarms) adjusts thresholds.
 
 ## Architecture
 
@@ -33,14 +35,21 @@ The ESP32 sends telemetry to the backend, and the backend handles severity decis
 ## Project Workflow
 
 ### 1) Data Ingestion
-- Hardware mode: ESP32 sends sensor payloads to `POST /event`.
+- Hardware mode: ESP32 sends sensor payload + crash image to `POST /event/camera`.
 - Demo mode: dashboard buttons submit predefined `SAFE`, `ALERT`, or `EMERGENCY` payloads to `POST /event`.
 
 ### 2) Perception + Decision
-- Backend normalizes telemetry and computes severity score:
-  - `SAFE` if score `< 30`
-  - `ALERT` if score `30–70`
-  - `EMERGENCY` if score `> 70`
+- Backend normalizes telemetry and computes severity score using:
+  - `impact_score = min(100, impact * 6.5)`
+  - `speed_score = min(100, speed / 140 * 100)`
+  - `tilt_score = min(100, tilt / 90 * 100)`
+  - `risk_score = impact_score*0.55 + speed_score*0.30 + tilt_score*0.15`
+  - low-speed suppression (`speed < 12 && impact < 7`) applies `risk_score *= 0.65`
+- Classification (adaptive):
+  - `SAFE` if `risk_score < (42 + shift)`
+  - `ALERT` if `42 + shift <= risk_score <= 72 + shift`
+  - `EMERGENCY` if `risk_score > 72 + shift`
+- `shift` is learned online from false-alarm ratio (cancelled incidents).
 
 ### 3) Confirmation Window
 - `ALERT` and `EMERGENCY` first enter `PENDING_CONFIRMATION`.
@@ -58,9 +67,10 @@ The ESP32 sends telemetry to the backend, and the backend handles severity decis
 
 ### 6) Persistence + Monitoring
 - Finalized events are appended to `events_log.jsonl`.
+- Adaptive learning profile is persisted in `learning_profile.json`.
 - Dashboard polls:
   - `GET /status` for latest state and recent activity.
-  - `GET /logs` for full event history.
+  - `GET /logs` for full event history (UI filters to ALERT/EMERGENCY rows).
 
 ## Repository Structure
 
@@ -71,7 +81,8 @@ The ESP32 sends telemetry to the backend, and the backend handles severity decis
 
 ## API Endpoints
 
-- `POST /event` — ingest telemetry event.
+- `POST /event` — ingest telemetry event (JSON).
+- `POST /event/camera` — ingest telemetry + crash image (multipart/form-data).
 - `POST /event/{event_id}/cancel` — cancel pending event.
 - `GET /status` — latest status and recent activity.
 - `GET /logs` — event history.
@@ -104,7 +115,7 @@ Dashboard: <http://127.0.0.1:8000>
    ```cpp
    const char* WIFI_SSID = "YOUR_WIFI";
    const char* WIFI_PASS = "YOUR_PASS";
-   const char* API_URL = "http://192.168.1.23:8000/event";
+   const char* API_URL = "http://192.168.1.23:8000/event/camera";
    ```
    Use your actual LAN IP in `API_URL` (not `127.0.0.1`).
 
@@ -119,7 +130,7 @@ Dashboard: <http://127.0.0.1:8000>
 ### Quick troubleshooting
 - `POST ... => -1` or timeout: wrong `API_URL`, network mismatch, or firewall blocking port `8000`.
 - No Wi-Fi connect on ESP32: wrong SSID/password or unsupported band (use 2.4 GHz).
-- Dashboard opens but no events: ensure sensor score crosses threshold so firmware sends `/event`.
+- Dashboard opens but no events: ensure sensor score crosses threshold so firmware sends `/event/camera`.
 
 ## Dashboard Demo (No Hardware Required)
 
