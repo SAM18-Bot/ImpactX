@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 app = FastAPI(title="ImpactX Emergency Response", version="1.1.0")
 
 LOG_FILE = Path("events_log.jsonl")
+LEARNING_FILE = Path("learning_profile.json")
 CRASH_IMAGE_DIR = Path("static/crash_images")
 CONFIRMATION_SECONDS = 20
 
@@ -51,11 +52,20 @@ class EventResult(BaseModel):
     activities: list[dict[str, str]]
 
 
+class DeviceReport(BaseModel):
+    device_id: str
+    connected: bool = True
+    event_id: int | None = None
+    false_alarm: bool = False
+
+
 state: dict[str, Any] = {
     "latest": None,
     "logs": [],
     "activities": [],
     "next_id": 1,
+    "learning": {"false_alarm_count": 0, "confirmed_count": 0, "threshold_shift": 0.0},
+    "devices": {},
 }
 
 
@@ -69,6 +79,50 @@ def add_activity(agent: str, message: str) -> AgentActivity:
     # Keep recent activity only for dashboard readability
     state["activities"] = state["activities"][-50:]
     return activity
+
+
+def _load_learning_profile() -> None:
+    if not LEARNING_FILE.exists():
+        return
+    try:
+        data = json.loads(LEARNING_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            state["learning"].update(
+                {
+                    "false_alarm_count": int(data.get("false_alarm_count", 0)),
+                    "confirmed_count": int(data.get("confirmed_count", 0)),
+                    "threshold_shift": float(data.get("threshold_shift", 0.0)),
+                }
+            )
+    except Exception as exc:
+        add_activity("Learning Agent", f"Profile load failed: {exc}")
+
+
+def _save_learning_profile() -> None:
+    LEARNING_FILE.write_text(json.dumps(state["learning"], indent=2), encoding="utf-8")
+
+
+def _update_learning(cancelled: bool) -> None:
+    if cancelled:
+        state["learning"]["false_alarm_count"] += 1
+    else:
+        state["learning"]["confirmed_count"] += 1
+
+    false_alarms = state["learning"]["false_alarm_count"]
+    confirmed = state["learning"]["confirmed_count"]
+    total = max(false_alarms + confirmed, 1)
+    false_alarm_rate = false_alarms / total
+
+    # Online threshold adaptation:
+    # More false alarms => increase threshold slightly.
+    # Strong confirmations => reduce threshold slightly.
+    shift = round(max(-6.0, min(12.0, (false_alarm_rate - 0.25) * 20.0)), 2)
+    state["learning"]["threshold_shift"] = shift
+    _save_learning_profile()
+    add_activity(
+        "Learning Agent",
+        f"Adaptive threshold shift updated to {shift:+.2f} (false alarm rate={false_alarm_rate:.2%})",
+    )
 
 
 # -----------------------------
@@ -97,14 +151,35 @@ def perception_agent(raw: SensorEvent) -> dict[str, Any]:
 
 
 def calculate_severity(event: dict[str, Any]) -> tuple[float, str]:
-    score = (event["impact"] * 0.5) + (event["speed"] * 0.3) + (event["tilt"] * 0.2)
-    if score < 30:
+    # Real-world oriented risk formula:
+    # - impact dominates (sudden g-force)
+    # - speed contributes kinetic risk (normalized)
+    # - tilt indicates rollover likelihood
+    # - low speed + high impact often means pothole/phone drop (false alarm control)
+    impact_score = min(100.0, event["impact"] * 6.5)
+    speed_score = min(100.0, (event["speed"] / 140.0) * 100.0)
+    tilt_score = min(100.0, (event["tilt"] / 90.0) * 100.0)
+
+    score = (impact_score * 0.55) + (speed_score * 0.30) + (tilt_score * 0.15)
+    if event["speed"] < 12 and event["impact"] < 7:
+        score *= 0.65
+
+    shift = float(state["learning"].get("threshold_shift", 0.0))
+    alert_threshold = 20 + shift
+    emergency_threshold = 50 + shift
+    if score < alert_threshold:
         status = "SAFE"
-    elif score <= 70:
+    elif score <= emergency_threshold:
         status = "ALERT"
     else:
         status = "EMERGENCY"
-    add_activity("Decision Agent", f"Score computed: {score:.2f}, status={status}")
+    add_activity(
+        "Decision Agent",
+        (
+            f"Score={score:.2f}, status={status}, "
+            f"thresholds(alert={alert_threshold:.2f}, emergency={emergency_threshold:.2f})"
+        ),
+    )
     return round(score, 2), status
 
 
@@ -161,6 +236,14 @@ def learning_agent(record: dict[str, Any]) -> None:
     with LOG_FILE.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record) + "\n")
     add_activity("Learning Agent", f"Event {record['event_id']} stored")
+
+
+def queue_device_command(command: str, event_id: int | None = None) -> None:
+    for device_id, device in state["devices"].items():
+        if not device.get("connected"):
+            continue
+        device["command"] = {"command": command, "event_id": event_id, "ts": utc_now()}
+        add_activity("Coordination Agent", f"Queued '{command}' for device {device_id}")
 
 
 def _twilio_env_ready() -> bool:
@@ -246,6 +329,7 @@ async def finalize_event_after_countdown(
     if final_status in {"ALERT", "EMERGENCY"}:
         hospital = coordination_agent(event["lat"], event["lon"])
         communication_agent(event["lat"], event["lon"], final_status)
+        queue_device_command(final_status, event_id=event_id)
 
     result = {
         "event_id": event_id,
@@ -260,6 +344,7 @@ async def finalize_event_after_countdown(
     state["latest"] = result
     state["logs"].append(result)
     learning_agent(result)
+    _update_learning(cancelled=False)
 
 
 async def _process_sensor_event(sensor_event: SensorEvent, crash_image_url: str | None = None) -> EventResult:
@@ -341,7 +426,51 @@ async def cancel_event(event_id: int):
     latest["status"] = "CANCELLED"
     state["logs"].append(dict(latest))
     learning_agent(dict(latest))
+    _update_learning(cancelled=True)
+    queue_device_command("CANCEL", event_id=event_id)
     return {"ok": True, "event_id": event_id, "status": "CANCELLED"}
+
+
+@app.post("/device/report")
+def device_report(report: DeviceReport):
+    device = state["devices"].setdefault(
+        report.device_id,
+        {"connected": False, "last_seen": None, "command": {"command": "NONE", "event_id": None, "ts": utc_now()}},
+    )
+    device["connected"] = report.connected
+    device["last_seen"] = utc_now()
+    if report.false_alarm and report.event_id is not None:
+        latest = state.get("latest")
+        if latest and latest.get("event_id") == report.event_id and latest.get("status") == "PENDING_CONFIRMATION":
+            latest["status"] = "CANCELLED"
+            state["logs"].append(dict(latest))
+            learning_agent(dict(latest))
+            _update_learning(cancelled=True)
+            device["command"] = {"command": "CANCEL", "event_id": report.event_id, "ts": utc_now()}
+            add_activity("Perception Agent", f"Hardware false alarm cancel from {report.device_id}")
+    return {"ok": True}
+
+
+@app.get("/device/{device_id}/command")
+def get_device_command(device_id: str):
+    device = state["devices"].setdefault(
+        device_id,
+        {"connected": True, "last_seen": utc_now(), "command": {"command": "NONE", "event_id": None, "ts": utc_now()}},
+    )
+    device["connected"] = True
+    device["last_seen"] = utc_now()
+    return device["command"]
+
+
+@app.post("/device/{device_id}/command/ack")
+def ack_device_command(device_id: str):
+    device = state["devices"].setdefault(
+        device_id,
+        {"connected": True, "last_seen": utc_now(), "command": {"command": "NONE", "event_id": None, "ts": utc_now()}},
+    )
+    device["command"] = {"command": "NONE", "event_id": None, "ts": utc_now()}
+    device["last_seen"] = utc_now()
+    return {"ok": True}
 
 
 @app.get("/status")
@@ -372,3 +501,6 @@ def dashboard():
     if dashboard_file.exists():
         return dashboard_file.read_text(encoding="utf-8")
     return "<h1>ImpactX Dashboard not found</h1>"
+
+
+_load_learning_profile()
