@@ -9,7 +9,7 @@ The ESP32 sends telemetry to the backend, and the backend handles severity decis
 - ESP32 + FastAPI architecture for live incident telemetry.
 - Real-time severity classification: `SAFE`, `ALERT`, `EMERGENCY`.
 - 20-second confirmation window before escalation.
-- ESP32-CAM uploads crash image + sensor/GPS bundle in one request.
+- ESP32 sends high-impact sensor/GPS telemetry for cloud decisioning.
 - Local emergency indication on device (red LED + buzzer) with green LED always on.
 - Dashboard for live status, activity feed, and event logs.
 - Optional Twilio integration for cloud SMS/call workflows.
@@ -21,7 +21,7 @@ The ESP32 sends telemetry to the backend, and the backend handles severity decis
 
 - Reads telemetry and computes local severity.
 - If backend is unavailable, keeps operating standalone with local cancel/alert logic.
-- If backend is available, sends only high-impact events (`impact > 20`) with image + telemetry.
+- If backend is available, sends only high-impact events (`impact > 20`) with telemetry.
 - Starts physical cancel window.
 - Polls backend command channel and executes remote `ALERT`/`EMERGENCY`/`CANCEL` actions.
 - Triggers local emergency outputs when required.
@@ -37,7 +37,7 @@ The ESP32 sends telemetry to the backend, and the backend handles severity decis
 ## Project Workflow
 
 ### 1) Data Ingestion
-- Hardware mode: ESP32 sends sensor payload + crash image to `POST /event/camera`.
+- Hardware mode: ESP32 sends sensor payload to `POST /event`.
 - Demo mode: dashboard buttons submit predefined `SAFE`, `ALERT`, or `EMERGENCY` payloads to `POST /event`.
 
 ### 2) Perception + Decision
@@ -84,7 +84,6 @@ The ESP32 sends telemetry to the backend, and the backend handles severity decis
 ## API Endpoints
 
 - `POST /event` — ingest telemetry event (JSON).
-- `POST /event/camera` — ingest telemetry + crash image (multipart/form-data).
 - `POST /event/{event_id}/cancel` — cancel pending event.
 - `POST /device/report` — device heartbeat + hardware false-alarm cancellation report.
 - `GET /device/{device_id}/command` — fetch latest backend command for ESP32.
@@ -135,7 +134,7 @@ Dashboard: <http://127.0.0.1:8000>
 ### Quick troubleshooting
 - `POST ... => -1` or timeout: wrong `API_URL`, network mismatch, or firewall blocking port `8000`.
 - No Wi-Fi connect on ESP32: wrong SSID/password or unsupported band (use 2.4 GHz).
-- Dashboard opens but no events: ensure sensor score crosses threshold so firmware sends `/event/camera`.
+- Dashboard opens but no events: ensure sensor score crosses threshold so firmware sends `/event`.
 - Firmware sends only high-impact candidates (`impact > 20`) to reduce low-impact network noise.
 
 ## Dashboard Demo (No Hardware Required)

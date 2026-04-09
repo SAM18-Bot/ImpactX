@@ -26,8 +26,6 @@
     th, td { border-bottom: 1px solid #243150; padding: 8px 6px; text-align: left; }
     th { color: #9db1e5; }
     .muted { color: #9db1e5; }
-    .crash-image-wrap { margin-top: 8px; background: #0f1830; border-radius: 8px; padding: 8px; min-height: 140px; display: flex; align-items: center; justify-content: center; }
-    .crash-image-wrap img { max-width: 100%; max-height: 260px; border-radius: 8px; }
     .hw { display: flex; gap: 10px; align-items: center; margin-top: 8px; }
     .led { width: 16px; height: 16px; border-radius: 50%; background: #333; box-shadow: inset 0 0 4px #000; }
     .led.green.on { background: #35d06f; box-shadow: 0 0 10px #35d06f; }
@@ -66,15 +64,6 @@
     </section>
 
     <section class="card">
-      <h2>Crash Image</h2>
-      <p class="muted">Image from ESP32-CAM for the selected/latest crash event.</p>
-      <div class="crash-image-wrap">
-        <img id="crashImage" alt="Crash event image" style="display:none;" />
-        <span id="noImageMsg" class="muted">No crash image available yet.</span>
-      </div>
-    </section>
-
-    <section class="card">
       <h2>Crash Event History</h2>
       <p class="muted">Recent ALERT/EMERGENCY events only.</p>
       <table>
@@ -85,7 +74,6 @@
             <th>Score</th>
             <th>Hospital</th>
             <th>Distance</th>
-            <th>Image</th>
           </tr>
         </thead>
         <tbody id="historyBody"></tbody>
@@ -192,18 +180,6 @@
       document.getElementById('distance').textContent = latest.hospital?.distance || '-';
       document.getElementById('eventTime').textContent = latest.created_at || '-';
 
-      const crashImage = document.getElementById('crashImage');
-      const noImageMsg = document.getElementById('noImageMsg');
-      if (latest.crash_image_url) {
-        crashImage.src = latest.crash_image_url;
-        crashImage.style.display = 'block';
-        noImageMsg.style.display = 'none';
-      } else {
-        crashImage.removeAttribute('src');
-        crashImage.style.display = 'none';
-        noImageMsg.style.display = 'block';
-      }
-
       const activityLines = (statusData.activity || []).map(
         a => `[${a.agent}] ${a.message} @ ${a.ts}`
       );
@@ -218,10 +194,43 @@
           <td>${event.score ?? '-'}</td>
           <td>${event.hospital?.hospital || '-'}</td>
           <td>${event.hospital?.distance || '-'}</td>
-          <td>${event.crash_image_url ? `<a href="${event.crash_image_url}" target="_blank">View</a>` : '-'}</td>
         </tr>
       `).join('');
-      document.getElementById('historyBody').innerHTML = rows || '<tr><td colspan="6" class="muted">No events recorded yet.</td></tr>';
+      document.getElementById('historyBody').innerHTML = rows || '<tr><td colspan="5" class="muted">No events recorded yet.</td></tr>';
+    }
+
+    function beep() {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'square';
+      osc.frequency.value = 1700;
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      gain.gain.value = 0.04;
+      osc.start();
+      setTimeout(() => {
+        osc.stop();
+        ctx.close();
+      }, 400);
+    }
+
+    function applyHardwareSimulation(status) {
+      const red = document.getElementById('redLed');
+      const buzzer = document.getElementById('buzzerState');
+      if (status === 'ALERT' || status === 'EMERGENCY' || status === 'PENDING_CONFIRMATION') {
+        red.classList.add('on');
+        buzzer.textContent = 'Buzzer: ON';
+        if (status !== lastHardwareStatus) {
+          beep();
+        }
+      } else {
+        red.classList.remove('on');
+        buzzer.textContent = 'Buzzer: OFF';
+      }
+      lastHardwareStatus = status;
     }
 
     function beep() {

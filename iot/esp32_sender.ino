@@ -8,7 +8,7 @@
 // ---------- Wi-Fi + API ----------
 const char* WIFI_SSID = "YOUR_WIFI";
 const char* WIFI_PASS = "YOUR_PASS";
-const char* API_URL = "http://YOUR_SERVER_IP:8000/event/camera";
+const char* API_URL = "http://YOUR_SERVER_IP:8000/event";
 const char* DEVICE_REPORT_URL = "http://YOUR_SERVER_IP:8000/device/report";
 const char* DEVICE_COMMAND_URL = "http://YOUR_SERVER_IP:8000/device/esp32cam-1/command";
 const char* DEVICE_ACK_URL = "http://YOUR_SERVER_IP:8000/device/esp32cam-1/command/ack";
@@ -45,45 +45,6 @@ int pendingBackendEventId = -1;
 unsigned long lastBackendPollMs = 0;
 const unsigned long BACKEND_POLL_INTERVAL_MS = 1200;
 
-// ---------- ESP32-CAM AI Thinker pins ----------
-#define PWDN_GPIO_NUM     32
-#define RESET_GPIO_NUM    -1
-#define XCLK_GPIO_NUM      0
-#define SIOD_GPIO_NUM     26
-#define SIOC_GPIO_NUM     27
-#define Y9_GPIO_NUM       35
-#define Y8_GPIO_NUM       34
-#define Y7_GPIO_NUM       39
-#define Y6_GPIO_NUM       36
-#define Y5_GPIO_NUM       21
-#define Y4_GPIO_NUM       19
-#define Y3_GPIO_NUM       18
-#define Y2_GPIO_NUM        5
-#define VSYNC_GPIO_NUM    25
-#define HREF_GPIO_NUM     23
-#define PCLK_GPIO_NUM     22
-
-bool cameraReady = false;
-
-// ---------- ESP32-CAM AI Thinker pins ----------
-#define PWDN_GPIO_NUM     32
-#define RESET_GPIO_NUM    -1
-#define XCLK_GPIO_NUM      0
-#define SIOD_GPIO_NUM     26
-#define SIOC_GPIO_NUM     27
-#define Y9_GPIO_NUM       35
-#define Y8_GPIO_NUM       34
-#define Y7_GPIO_NUM       39
-#define Y6_GPIO_NUM       36
-#define Y5_GPIO_NUM       21
-#define Y4_GPIO_NUM       19
-#define Y3_GPIO_NUM       18
-#define Y2_GPIO_NUM        5
-#define VSYNC_GPIO_NUM    25
-#define HREF_GPIO_NUM     23
-#define PCLK_GPIO_NUM     22
-
-bool cameraReady = false;
 
 void setupMPU() {
   Wire.begin();
@@ -143,39 +104,6 @@ void connectWiFi() {
   }
 }
 
-void setupCamera() {
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = FRAMESIZE_QVGA;
-  config.jpeg_quality = 12;
-  config.fb_count = 1;
-  config.grab_mode = CAMERA_GRAB_LATEST;
-
-  esp_err_t err = esp_camera_init(&config);
-  cameraReady = (err == ESP_OK);
-  Serial.println(cameraReady ? "Camera initialized" : "Camera init failed");
-}
-
-
 String buildIsoTimestamp() {
   if (gps.date.isValid() && gps.time.isValid()) {
     char buf[30];
@@ -191,51 +119,22 @@ bool sendEventToBackend(float impact, float tilt, float speed, float lat, float 
   if (WiFi.status() != WL_CONNECTED || !cameraReady) {
     return false;
   }
-
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) {
-    Serial.println("Camera capture failed");
-    return false;
-  }
+  String payload = "{";
+  payload += "\"impact\":" + String(impact, 2) + ",";
+  payload += "\"tilt\":" + String(tilt, 2) + ",";
+  payload += "\"speed\":" + String(speed, 2) + ",";
+  payload += "\"lat\":" + String(lat, 6) + ",";
+  payload += "\"lon\":" + String(lon, 6) + ",";
+  payload += "\"timestamp\":\"" + buildIsoTimestamp() + "\"";
+  payload += "}";
 
   for (int i = 1; i <= BACKEND_RETRIES; i++) {
     HTTPClient http;
     http.begin(API_URL);
-    String boundary = "----ImpactXBoundary";
-    http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
-
-    String head = "";
-    auto addField = [&](const String& name, const String& value) {
-      head += "--" + boundary + "\r\n";
-      head += "Content-Disposition: form-data; name=\"" + name + "\"\r\n\r\n";
-      head += value + "\r\n";
-    };
-    addField("impact", String(impact, 2));
-    addField("tilt", String(tilt, 2));
-    addField("speed", String(speed, 2));
-    addField("lat", String(lat, 6));
-    addField("lon", String(lon, 6));
-    addField("timestamp", buildIsoTimestamp());
-    head += "--" + boundary + "\r\n";
-    head += "Content-Disposition: form-data; name=\"image\"; filename=\"crash.jpg\"\r\n";
-    head += "Content-Type: image/jpeg\r\n\r\n";
-
-    String tail = "\r\n--" + boundary + "--\r\n";
-    int totalLength = head.length() + fb->len + tail.length();
-    uint8_t *body = (uint8_t*)malloc(totalLength);
-    if (!body) {
-      Serial.println("OOM for multipart payload");
-      http.end();
-      break;
-    }
-    memcpy(body, head.c_str(), head.length());
-    memcpy(body + head.length(), fb->buf, fb->len);
-    memcpy(body + head.length() + fb->len, tail.c_str(), tail.length());
-
-    int code = http.POST(body, totalLength);
+    http.addHeader("Content-Type", "application/json");
+    int code = http.POST(payload);
     String responseBody = http.getString();
-    free(body);
-    Serial.printf("POST /event/camera try %d => %d\n", i, code);
+    Serial.printf("POST /event try %d => %d\n", i, code);
     if (code > 0 && code < 500) {
       int idx = responseBody.indexOf("\"event_id\":");
       if (idx >= 0) {
