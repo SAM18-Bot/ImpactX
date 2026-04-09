@@ -20,8 +20,10 @@ The ESP32 sends telemetry to the backend, and the backend handles severity decis
 ### Edge Layer (ESP32 + MPU6050 + GPS)
 
 - Reads telemetry and computes local severity.
-- Attempts delivery to backend.
+- If backend is unavailable, keeps operating standalone with local cancel/alert logic.
+- If backend is available, sends only high-impact events (`impact > 20`) with image + telemetry.
 - Starts physical cancel window.
+- Polls backend command channel and executes remote `ALERT`/`EMERGENCY`/`CANCEL` actions.
 - Triggers local emergency outputs when required.
 
 ### Cloud Layer (FastAPI)
@@ -84,6 +86,9 @@ The ESP32 sends telemetry to the backend, and the backend handles severity decis
 - `POST /event` — ingest telemetry event (JSON).
 - `POST /event/camera` — ingest telemetry + crash image (multipart/form-data).
 - `POST /event/{event_id}/cancel` — cancel pending event.
+- `POST /device/report` — device heartbeat + hardware false-alarm cancellation report.
+- `GET /device/{device_id}/command` — fetch latest backend command for ESP32.
+- `POST /device/{device_id}/command/ack` — acknowledge command execution.
 - `GET /status` — latest status and recent activity.
 - `GET /logs` — event history.
 - `GET /health` — service health check.

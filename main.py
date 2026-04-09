@@ -52,12 +52,20 @@ class EventResult(BaseModel):
     activities: list[dict[str, str]]
 
 
+class DeviceReport(BaseModel):
+    device_id: str
+    connected: bool = True
+    event_id: int | None = None
+    false_alarm: bool = False
+
+
 state: dict[str, Any] = {
     "latest": None,
     "logs": [],
     "activities": [],
     "next_id": 1,
     "learning": {"false_alarm_count": 0, "confirmed_count": 0, "threshold_shift": 0.0},
+    "devices": {},
 }
 
 
@@ -230,6 +238,14 @@ def learning_agent(record: dict[str, Any]) -> None:
     add_activity("Learning Agent", f"Event {record['event_id']} stored")
 
 
+def queue_device_command(command: str, event_id: int | None = None) -> None:
+    for device_id, device in state["devices"].items():
+        if not device.get("connected"):
+            continue
+        device["command"] = {"command": command, "event_id": event_id, "ts": utc_now()}
+        add_activity("Coordination Agent", f"Queued '{command}' for device {device_id}")
+
+
 def _twilio_env_ready() -> bool:
     required = [
         "TWILIO_ACCOUNT_SID",
@@ -313,6 +329,7 @@ async def finalize_event_after_countdown(
     if final_status in {"ALERT", "EMERGENCY"}:
         hospital = coordination_agent(event["lat"], event["lon"])
         communication_agent(event["lat"], event["lon"], final_status)
+        queue_device_command(final_status, event_id=event_id)
 
     result = {
         "event_id": event_id,
@@ -410,7 +427,50 @@ async def cancel_event(event_id: int):
     state["logs"].append(dict(latest))
     learning_agent(dict(latest))
     _update_learning(cancelled=True)
+    queue_device_command("CANCEL", event_id=event_id)
     return {"ok": True, "event_id": event_id, "status": "CANCELLED"}
+
+
+@app.post("/device/report")
+def device_report(report: DeviceReport):
+    device = state["devices"].setdefault(
+        report.device_id,
+        {"connected": False, "last_seen": None, "command": {"command": "NONE", "event_id": None, "ts": utc_now()}},
+    )
+    device["connected"] = report.connected
+    device["last_seen"] = utc_now()
+    if report.false_alarm and report.event_id is not None:
+        latest = state.get("latest")
+        if latest and latest.get("event_id") == report.event_id and latest.get("status") == "PENDING_CONFIRMATION":
+            latest["status"] = "CANCELLED"
+            state["logs"].append(dict(latest))
+            learning_agent(dict(latest))
+            _update_learning(cancelled=True)
+            device["command"] = {"command": "CANCEL", "event_id": report.event_id, "ts": utc_now()}
+            add_activity("Perception Agent", f"Hardware false alarm cancel from {report.device_id}")
+    return {"ok": True}
+
+
+@app.get("/device/{device_id}/command")
+def get_device_command(device_id: str):
+    device = state["devices"].setdefault(
+        device_id,
+        {"connected": True, "last_seen": utc_now(), "command": {"command": "NONE", "event_id": None, "ts": utc_now()}},
+    )
+    device["connected"] = True
+    device["last_seen"] = utc_now()
+    return device["command"]
+
+
+@app.post("/device/{device_id}/command/ack")
+def ack_device_command(device_id: str):
+    device = state["devices"].setdefault(
+        device_id,
+        {"connected": True, "last_seen": utc_now(), "command": {"command": "NONE", "event_id": None, "ts": utc_now()}},
+    )
+    device["command"] = {"command": "NONE", "event_id": None, "ts": utc_now()}
+    device["last_seen"] = utc_now()
+    return {"ok": True}
 
 
 @app.get("/status")

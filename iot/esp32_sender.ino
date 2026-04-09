@@ -9,6 +9,10 @@
 const char* WIFI_SSID = "YOUR_WIFI";
 const char* WIFI_PASS = "YOUR_PASS";
 const char* API_URL = "http://YOUR_SERVER_IP:8000/event/camera";
+const char* DEVICE_REPORT_URL = "http://YOUR_SERVER_IP:8000/device/report";
+const char* DEVICE_COMMAND_URL = "http://YOUR_SERVER_IP:8000/device/esp32cam-1/command";
+const char* DEVICE_ACK_URL = "http://YOUR_SERVER_IP:8000/device/esp32cam-1/command/ack";
+const char* DEVICE_ID = "esp32cam-1";
 
 // ---------- MPU6050 ----------
 const int MPU_ADDR = 0x68;
@@ -37,6 +41,29 @@ float pendingTilt = 0;
 float pendingSpeed = 0;
 float pendingLat = 0;
 float pendingLon = 0;
+int pendingBackendEventId = -1;
+unsigned long lastBackendPollMs = 0;
+const unsigned long BACKEND_POLL_INTERVAL_MS = 1200;
+
+// ---------- ESP32-CAM AI Thinker pins ----------
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+
+bool cameraReady = false;
 
 // ---------- ESP32-CAM AI Thinker pins ----------
 #define PWDN_GPIO_NUM     32
@@ -206,9 +233,15 @@ bool sendEventToBackend(float impact, float tilt, float speed, float lat, float 
     memcpy(body + head.length() + fb->len, tail.c_str(), tail.length());
 
     int code = http.POST(body, totalLength);
+    String responseBody = http.getString();
     free(body);
     Serial.printf("POST /event/camera try %d => %d\n", i, code);
     if (code > 0 && code < 500) {
+      int idx = responseBody.indexOf("\"event_id\":");
+      if (idx >= 0) {
+        String ev = responseBody.substring(idx + 11);
+        pendingBackendEventId = ev.toInt();
+      }
       http.end();
       esp_camera_fb_return(fb);
       return true;
@@ -224,6 +257,61 @@ void triggerLocalAlert(const String& msg) {
   digitalWrite(RED_LED_PIN, HIGH);
   tone(BUZZER_PIN, 1800, 600);
   Serial.println(msg);
+}
+
+void clearLocalAlert() {
+  digitalWrite(RED_LED_PIN, LOW);
+  noTone(BUZZER_PIN);
+}
+
+void reportDeviceStatus(bool falseAlarm = false, int eventId = -1) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.begin(DEVICE_REPORT_URL);
+  http.addHeader("Content-Type", "application/json");
+  String body = "{";
+  body += "\"device_id\":\"" + String(DEVICE_ID) + "\",";
+  body += "\"connected\":true,";
+  body += "\"false_alarm\":" + String(falseAlarm ? "true" : "false");
+  if (eventId >= 0) {
+    body += ",\"event_id\":" + String(eventId);
+  }
+  body += "}";
+  http.POST(body);
+  http.end();
+}
+
+void ackCommand() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  http.begin(DEVICE_ACK_URL);
+  http.POST("");
+  http.end();
+}
+
+void pollBackendCommand() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (millis() - lastBackendPollMs < BACKEND_POLL_INTERVAL_MS) return;
+  lastBackendPollMs = millis();
+
+  HTTPClient http;
+  http.begin(DEVICE_COMMAND_URL);
+  int code = http.GET();
+  if (code <= 0) {
+    http.end();
+    return;
+  }
+  String body = http.getString();
+  http.end();
+  if (body.indexOf("\"command\":\"ALERT\"") >= 0 || body.indexOf("\"command\":\"EMERGENCY\"") >= 0) {
+    triggerLocalAlert("Backend commanded emergency output.");
+    delay(2500);
+    clearLocalAlert();
+    ackCommand();
+  } else if (body.indexOf("\"command\":\"CANCEL\"") >= 0) {
+    clearLocalAlert();
+    ackCommand();
+  }
 }
 
 void startPendingIncident(float impact, float tilt, float speed, float lat, float lon) {
@@ -252,12 +340,14 @@ void setup() {
   gpsSerial.begin(9600, SERIAL_8N1, 16, 17);
 
   connectWiFi();
+  reportDeviceStatus(false, -1);
 }
 
 void loop() {
   while (gpsSerial.available() > 0) {
     gps.encode(gpsSerial.read());
   }
+  pollBackendCommand();
 
   readMPU();
   float impact = calculateImpact();
@@ -282,8 +372,9 @@ void loop() {
   if (incidentPending) {
     if (digitalRead(CANCEL_BUTTON_PIN) == LOW) {
       incidentPending = false;
-      digitalWrite(RED_LED_PIN, LOW);
-      noTone(BUZZER_PIN);
+      clearLocalAlert();
+      reportDeviceStatus(true, pendingBackendEventId);
+      pendingBackendEventId = -1;
       Serial.println("Physical cancel button pressed. False alarm cleared.");
       delay(350);
     } else if (millis() - pendingSince >= CONFIRM_MS) {
@@ -295,8 +386,7 @@ void loop() {
       triggerLocalAlert(msg);
       Serial.println("No cancel in 20s -> local emergency response triggered.");
       delay(2500);
-      digitalWrite(RED_LED_PIN, LOW);
-      noTone(BUZZER_PIN);
+      clearLocalAlert();
     }
   }
   delay(300);
