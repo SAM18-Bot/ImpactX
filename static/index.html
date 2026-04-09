@@ -233,6 +233,40 @@
       lastHardwareStatus = status;
     }
 
+    function beep() {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'square';
+      osc.frequency.value = 1700;
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      gain.gain.value = 0.04;
+      osc.start();
+      setTimeout(() => {
+        osc.stop();
+        ctx.close();
+      }, 400);
+    }
+
+    function applyHardwareSimulation(status) {
+      const red = document.getElementById('redLed');
+      const buzzer = document.getElementById('buzzerState');
+      if (status === 'ALERT' || status === 'EMERGENCY' || status === 'PENDING_CONFIRMATION') {
+        red.classList.add('on');
+        buzzer.textContent = 'Buzzer: ON';
+        if (status !== lastHardwareStatus) {
+          beep();
+        }
+      } else {
+        red.classList.remove('on');
+        buzzer.textContent = 'Buzzer: OFF';
+      }
+      lastHardwareStatus = status;
+    }
+
     document.getElementById('refreshBtn').addEventListener('click', refresh);
     document.getElementById('sendMyLocationEventBtn').addEventListener('click', sendDemoEventFromMyLocation);
     document.getElementById('sendSafeBtn').addEventListener('click', () => sendScenarioEvent('SAFE'));

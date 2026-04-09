@@ -3,6 +3,7 @@
 #include <HTTPClient.h>
 #include <TinyGPSPlus.h>
 #include <HardwareSerial.h>
+#include "esp_camera.h"
 
 // ---------- Wi-Fi + API ----------
 const char* WIFI_SSID = "YOUR_WIFI";
@@ -115,7 +116,7 @@ String buildIsoTimestamp() {
 }
 
 bool sendEventToBackend(float impact, float tilt, float speed, float lat, float lon) {
-  if (WiFi.status() != WL_CONNECTED) {
+  if (WiFi.status() != WL_CONNECTED || !cameraReady) {
     return false;
   }
   String payload = "{";
@@ -141,11 +142,13 @@ bool sendEventToBackend(float impact, float tilt, float speed, float lat, float 
         pendingBackendEventId = ev.toInt();
       }
       http.end();
+      esp_camera_fb_return(fb);
       return true;
     }
     http.end();
     delay(400);
   }
+  esp_camera_fb_return(fb);
   return false;
 }
 
@@ -232,6 +235,7 @@ void setup() {
   digitalWrite(RED_LED_PIN, LOW);
 
   setupMPU();
+  setupCamera();
   gpsSerial.begin(9600, SERIAL_8N1, 16, 17);
 
   connectWiFi();

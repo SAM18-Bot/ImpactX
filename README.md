@@ -119,7 +119,7 @@ Dashboard: <http://127.0.0.1:8000>
    ```cpp
    const char* WIFI_SSID = "YOUR_WIFI";
    const char* WIFI_PASS = "YOUR_PASS";
-   const char* API_URL = "http://192.168.1.23:8000/event";
+   const char* API_URL = "http://192.168.1.23:8000/event/camera";
    ```
    Use your actual LAN IP in `API_URL` (not `127.0.0.1`).
 
