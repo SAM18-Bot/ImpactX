@@ -1,292 +1,413 @@
-#include <Wire.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <Wire.h>
 #include <TinyGPSPlus.h>
-#include <HardwareSerial.h>
-#include "esp_camera.h"
 
-// ---------- Wi-Fi + API ----------
-const char* WIFI_SSID = "YOUR_WIFI";
-const char* WIFI_PASS = "YOUR_PASS";
-const char* API_URL = "http://YOUR_SERVER_IP:8000/event";
-const char* DEVICE_REPORT_URL = "http://YOUR_SERVER_IP:8000/device/report";
-const char* DEVICE_COMMAND_URL = "http://YOUR_SERVER_IP:8000/device/esp32cam-1/command";
-const char* DEVICE_ACK_URL = "http://YOUR_SERVER_IP:8000/device/esp32cam-1/command/ack";
-const char* DEVICE_ID = "esp32cam-1";
+// ---------------- CONFIG ----------------
+const char* ssid     = "GT20";
+const char* password = "12345678";
 
-// ---------- MPU6050 ----------
+// ⬇ Set this to your PC's local IP (run `ipconfig` on Windows / `ip a` on Linux)
+const char* BACKEND_IP = "IP";
+const int   BACKEND_PORT = 8000;
+const char* DEVICE_ID    = "esp32-001"; // unique ID for your device
+
+// Derived URLs
+String EVENT_URL;
+String COMMAND_URL;
+
+// ---------------- MPU ----------------
 const int MPU_ADDR = 0x68;
-float accelX, accelY, accelZ;
+float ax, ay, az;
 
-// ---------- Pins ----------
-const int CANCEL_BUTTON_PIN = 4;  // pull-up button to GND
-const int BUZZER_PIN = 26;
-const int RED_LED_PIN = 2;
-const int GREEN_LED_PIN = 33;
-
-// ---------- GPS (NEO-6M) ----------
+// ---------------- GPS ----------------
 TinyGPSPlus gps;
-HardwareSerial gpsSerial(1);       // RX=16 TX=17
+HardwareSerial gpsSerial(1);
 
-// ---------- Edge decision ----------
-const float EDGE_ALERT_THRESHOLD = 20.0;
-const float EDGE_EMERGENCY_THRESHOLD = 50.0;
-const unsigned long CONFIRM_MS = 20000; // 20 seconds
-const int BACKEND_RETRIES = 5;
+// ---------------- PINS ----------------
+#define GREEN_LED 33
+#define RED_LED    2
+#define BUZZER    26
+#define BUTTON     4
 
-bool incidentPending = false;
-unsigned long pendingSince = 0;
-float pendingImpact = 0;
-float pendingTilt = 0;
-float pendingSpeed = 0;
-float pendingLat = 0;
-float pendingLon = 0;
-int pendingBackendEventId = -1;
-unsigned long lastBackendPollMs = 0;
-const unsigned long BACKEND_POLL_INTERVAL_MS = 1200;
+// ---------------- STATE ----------------
+bool alertActive    = false;
+bool waitingBackend = false;
+unsigned long eventTime = 0;
 
+// ---------------- FILTER ----------------
+float filteredImpact = 0;
+int   rolloverCount  = 0;
 
-void setupMPU() {
-  Wire.begin();
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(RED_LED,   OUTPUT);
+  pinMode(BUZZER,    OUTPUT);
+  pinMode(BUTTON,    INPUT_PULLUP);
+
+  digitalWrite(GREEN_LED, HIGH);
+
+  Wire.begin(14, 15);
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x6B);
   Wire.write(0);
   Wire.endTransmission(true);
+
+  gpsSerial.begin(9600, SERIAL_8N1, 16, 17);
+
+  // Build URLs at runtime
+  EVENT_URL   = String("http://") + BACKEND_IP + ":" + BACKEND_PORT + "/event";
+  COMMAND_URL = String("http://") + BACKEND_IP + ":" + BACKEND_PORT + "/device/" + DEVICE_ID + "/command";
+
+  Serial.println("EVENT_URL:   " + EVENT_URL);
+  Serial.println("COMMAND_URL: " + COMMAND_URL);
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected: " + WiFi.localIP().toString());
 }
 
+// ---------------- MPU ----------------
 void readMPU() {
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x3B);
   Wire.endTransmission(false);
   Wire.requestFrom(MPU_ADDR, 6, true);
 
-  int16_t rawX = Wire.read() << 8 | Wire.read();
-  int16_t rawY = Wire.read() << 8 | Wire.read();
-  int16_t rawZ = Wire.read() << 8 | Wire.read();
-
-  accelX = rawX / 16384.0;
-  accelY = rawY / 16384.0;
-  accelZ = rawZ / 16384.0;
+  ax = (Wire.read() << 8 | Wire.read()) / 16384.0;
+  ay = (Wire.read() << 8 | Wire.read()) / 16384.0;
+  az = (Wire.read() << 8 | Wire.read()) / 16384.0;
 }
 
-float calculateImpact() {
-  float magnitude = sqrt(accelX * accelX + accelY * accelY + accelZ * accelZ);
-  return fabs(magnitude - 1.0) * 10.0;
+// ---------------- IMPACT ----------------
+float getImpact() {
+  float g   = sqrt(ax * ax + ay * ay + az * az);
+  float raw = fabs(g - 1.0) * 5.0;
+  filteredImpact = 0.8 * filteredImpact + 0.2 * raw;
+  return filteredImpact;
 }
 
-float calculateTilt() {
-  return fabs(atan2(accelY, accelZ) * 180.0 / PI);
+// ---------------- ANGLES ----------------
+void getAngles(float &pitch, float &roll) {
+  pitch = atan2(ax, sqrt(ay * ay + az * az)) * 180 / PI;
+  roll  = atan2(ay, sqrt(ax * ax + az * az)) * 180 / PI;
 }
 
-float calculateSeverity(float impact, float speed, float tilt) {
-  float impactScore = min(100.0, impact * 6.5);
-  float speedScore = min(100.0, (speed / 140.0) * 100.0);
-  float tiltScore = min(100.0, (tilt / 90.0) * 100.0);
-  float score = (impactScore * 0.55) + (speedScore * 0.30) + (tiltScore * 0.15);
-  if (speed < 12 && impact < 7) {
-    score *= 0.65;
-  }
-  return score;
-}
+// ---------------- SEND EVENT ----------------
+void sendEvent(float impact, float speed, float lat, float lon) {
+  if (WiFi.status() != WL_CONNECTED) return;
 
-void connectWiFi() {
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-    delay(300);
-    attempts++;
-    Serial.print(".");
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi connected");
-  } else {
-    Serial.println("\nWiFi unavailable");
-  }
-}
+  HTTPClient http;
+  http.begin(EVENT_URL);
+  http.addHeader("Content-Type", "application/json");
 
-String buildIsoTimestamp() {
-  if (gps.date.isValid() && gps.time.isValid()) {
-    char buf[30];
-    snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
-             gps.date.year(), gps.date.month(), gps.date.day(),
-             gps.time.hour(), gps.time.minute(), gps.time.second());
-    return String(buf);
-  }
-  return "2026-01-01T00:00:00Z";
-}
-
-bool sendEventToBackend(float impact, float tilt, float speed, float lat, float lon) {
-  if (WiFi.status() != WL_CONNECTED || !cameraReady) {
-    return false;
-  }
   String payload = "{";
-  payload += "\"impact\":" + String(impact, 2) + ",";
-  payload += "\"tilt\":" + String(tilt, 2) + ",";
-  payload += "\"speed\":" + String(speed, 2) + ",";
-  payload += "\"lat\":" + String(lat, 6) + ",";
-  payload += "\"lon\":" + String(lon, 6) + ",";
-  payload += "\"timestamp\":\"" + buildIsoTimestamp() + "\"";
+  payload += "\"impact\":"  + String(impact, 2) + ",";
+  payload += "\"speed\":"   + String(speed,  2) + ",";
+  payload += "\"lat\":"     + String(lat,    6) + ",";
+  payload += "\"lon\":"     + String(lon,    6);
   payload += "}";
 
-  for (int i = 1; i <= BACKEND_RETRIES; i++) {
-    HTTPClient http;
-    http.begin(API_URL);
-    http.addHeader("Content-Type", "application/json");
-    int code = http.POST(payload);
-    String responseBody = http.getString();
-    Serial.printf("POST /event try %d => %d\n", i, code);
-    if (code > 0 && code < 500) {
-      int idx = responseBody.indexOf("\"event_id\":");
-      if (idx >= 0) {
-        String ev = responseBody.substring(idx + 11);
-        pendingBackendEventId = ev.toInt();
-      }
-      http.end();
-      esp_camera_fb_return(fb);
-      return true;
-    }
-    http.end();
-    delay(400);
-  }
-  esp_camera_fb_return(fb);
-  return false;
-}
-
-void triggerLocalAlert(const String& msg) {
-  digitalWrite(RED_LED_PIN, HIGH);
-  tone(BUZZER_PIN, 1800, 600);
-  Serial.println(msg);
-}
-
-void clearLocalAlert() {
-  digitalWrite(RED_LED_PIN, LOW);
-  noTone(BUZZER_PIN);
-}
-
-void reportDeviceStatus(bool falseAlarm = false, int eventId = -1) {
-  if (WiFi.status() != WL_CONNECTED) return;
-  HTTPClient http;
-  http.begin(DEVICE_REPORT_URL);
-  http.addHeader("Content-Type", "application/json");
-  String body = "{";
-  body += "\"device_id\":\"" + String(DEVICE_ID) + "\",";
-  body += "\"connected\":true,";
-  body += "\"false_alarm\":" + String(falseAlarm ? "true" : "false");
-  if (eventId >= 0) {
-    body += ",\"event_id\":" + String(eventId);
-  }
-  body += "}";
-  http.POST(body);
+  int code = http.POST(payload);
+  Serial.print("Event POST => "); Serial.println(code);
   http.end();
 }
 
-void ackCommand() {
+// ---------------- COMMAND POLLING ----------------
+void checkCommand() {
   if (WiFi.status() != WL_CONNECTED) return;
-  HTTPClient http;
-  http.begin(DEVICE_ACK_URL);
-  http.POST("");
-  http.end();
-}
-
-void pollBackendCommand() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  if (millis() - lastBackendPollMs < BACKEND_POLL_INTERVAL_MS) return;
-  lastBackendPollMs = millis();
 
   HTTPClient http;
-  http.begin(DEVICE_COMMAND_URL);
+  http.begin(COMMAND_URL);
+
   int code = http.GET();
-  if (code <= 0) {
-    http.end();
-    return;
+  if (code == 200) {
+    String res = http.getString();
+    Serial.print("Command: "); Serial.println(res);
+
+    if (res.indexOf("ALERT") >= 0 || res.indexOf("EMERGENCY") >= 0) triggerAlert();
+    if (res.indexOf("STOP")  >= 0 || res.indexOf("CANCEL")    >= 0) resetSystem();
   }
-  String body = http.getString();
   http.end();
-  if (body.indexOf("\"command\":\"ALERT\"") >= 0 || body.indexOf("\"command\":\"EMERGENCY\"") >= 0) {
-    triggerLocalAlert("Backend commanded emergency output.");
-    delay(2500);
-    clearLocalAlert();
-    ackCommand();
-  } else if (body.indexOf("\"command\":\"CANCEL\"") >= 0) {
-    clearLocalAlert();
-    ackCommand();
-  }
 }
 
-void startPendingIncident(float impact, float tilt, float speed, float lat, float lon) {
-  incidentPending = true;
-  pendingSince = millis();
-  pendingImpact = impact;
-  pendingTilt = tilt;
-  pendingSpeed = speed;
-  pendingLat = lat;
-  pendingLon = lon;
-
-  Serial.println("Edge crash candidate detected. Waiting 20s for physical cancel button...");
+// ---------------- ALERT ----------------
+void triggerAlert() {
+  alertActive = true;
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(RED_LED,   HIGH);
+  tone(BUZZER, 2000);
+  Serial.println("ALERT TRIGGERED");
 }
 
-void setup() {
-  Serial.begin(115200);
-  pinMode(CANCEL_BUTTON_PIN, INPUT_PULLUP);
-  pinMode(RED_LED_PIN, OUTPUT);
-  pinMode(GREEN_LED_PIN, OUTPUT);
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(GREEN_LED_PIN, HIGH); // green stays always ON
-  digitalWrite(RED_LED_PIN, LOW);
-
-  setupMPU();
-  setupCamera();
-  gpsSerial.begin(9600, SERIAL_8N1, 16, 17);
-
-  connectWiFi();
-  reportDeviceStatus(false, -1);
+// ---------------- RESET ----------------
+void resetSystem() {
+  alertActive    = false;
+  waitingBackend = false;
+  digitalWrite(GREEN_LED, HIGH);
+  digitalWrite(RED_LED,   LOW);
+  noTone(BUZZER);
+  Serial.println("RESET");
 }
 
+// ---------------- LOOP ----------------
 void loop() {
-  while (gpsSerial.available() > 0) {
-    gps.encode(gpsSerial.read());
-  }
-  pollBackendCommand();
+  while (gpsSerial.available()) gps.encode(gpsSerial.read());
+
+  float speed = gps.speed.isValid()    ? gps.speed.kmph()    : 0;
+  float lat   = gps.location.isValid() ? gps.location.lat()  : 0;
+  float lon   = gps.location.isValid() ? gps.location.lng()  : 0;
 
   readMPU();
-  float impact = calculateImpact();
-  float tilt = calculateTilt();
-  float speed = gps.speed.isValid() ? gps.speed.kmph() : 0.0;
+  float impact = getImpact();
 
-  if (!incidentPending) {
-    float score = calculateSeverity(impact, speed, tilt);
-    if (impact > 20.0 && score >= EDGE_ALERT_THRESHOLD) {
-      float lat = gps.location.isValid() ? gps.location.lat() : 0.0;
-      float lon = gps.location.isValid() ? gps.location.lng() : 0.0;
+  float pitch, roll;
+  getAngles(pitch, roll);
 
-      bool delivered = sendEventToBackend(impact, tilt, speed, lat, lon);
-      if (!delivered) {
-        Serial.println("Backend unavailable after retries.");
-      }
+  // -------- ROLLOVER DETECTION --------
+  if (abs(pitch) > 60 || abs(roll) > 60) rolloverCount++;
+  else rolloverCount = 0;
 
-      startPendingIncident(impact, tilt, speed, lat, lon);
+  if (rolloverCount >= 3 && !alertActive) triggerAlert();
+
+  // -------- IMPACT DETECTION --------
+  if (!alertActive && impact > 20) {
+    if (WiFi.status() == WL_CONNECTED) {
+      sendEvent(impact, speed, lat, lon);
+      waitingBackend = true;
+      eventTime = millis();
+    } else {
+      triggerAlert(); // offline fallback
     }
   }
 
-  if (incidentPending) {
-    if (digitalRead(CANCEL_BUTTON_PIN) == LOW) {
-      incidentPending = false;
-      clearLocalAlert();
-      reportDeviceStatus(true, pendingBackendEventId);
-      pendingBackendEventId = -1;
-      Serial.println("Physical cancel button pressed. False alarm cleared.");
-      delay(350);
-    } else if (millis() - pendingSince >= CONFIRM_MS) {
-      incidentPending = false;
-      float score = calculateSeverity(pendingImpact, pendingSpeed, pendingTilt);
-      String level = score >= EDGE_EMERGENCY_THRESHOLD ? "EMERGENCY" : "ALERT";
-      String msg = "ImpactX " + level + "! Location: https://maps.google.com/?q=" +
-                   String(pendingLat, 6) + "," + String(pendingLon, 6);
-      triggerLocalAlert(msg);
-      Serial.println("No cancel in 20s -> local emergency response triggered.");
-      delay(2500);
-      clearLocalAlert();
+  // -------- BACKEND TIMEOUT --------
+  if (waitingBackend && millis() - eventTime > 5000) {
+    triggerAlert();
+    waitingBackend = false;
+  }
+
+  // -------- COMMAND POLL --------
+  checkCommand();
+
+  // -------- BUTTON CANCEL --------
+  if (alertActive && digitalRead(BUTTON) == LOW) {
+    resetSystem();
+    delay(300);
+  }
+
+  delay(200);
+}#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <TinyGPSPlus.h>
+
+// ---------------- CONFIG ----------------
+const char* ssid     = "GT20";
+const char* password = "12345678";
+
+// ⬇ Set this to your PC's local IP (run `ipconfig` on Windows / `ip a` on Linux)
+const char* BACKEND_IP = "10.41.189.236";
+const int   BACKEND_PORT = 8000;
+const char* DEVICE_ID    = "esp32-001"; // unique ID for your device
+
+// Derived URLs
+String EVENT_URL;
+String COMMAND_URL;
+
+// ---------------- MPU ----------------
+const int MPU_ADDR = 0x68;
+float ax, ay, az;
+
+// ---------------- GPS ----------------
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(1);
+
+// ---------------- PINS ----------------
+#define GREEN_LED 33
+#define RED_LED    2
+#define BUZZER    26
+#define BUTTON     4
+
+// ---------------- STATE ----------------
+bool alertActive    = false;
+bool waitingBackend = false;
+unsigned long eventTime = 0;
+
+// ---------------- FILTER ----------------
+float filteredImpact = 0;
+int   rolloverCount  = 0;
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(RED_LED,   OUTPUT);
+  pinMode(BUZZER,    OUTPUT);
+  pinMode(BUTTON,    INPUT_PULLUP);
+
+  digitalWrite(GREEN_LED, HIGH);
+
+  Wire.begin(14, 15);
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0);
+  Wire.endTransmission(true);
+
+  gpsSerial.begin(9600, SERIAL_8N1, 16, 17);
+
+  // Build URLs at runtime
+  EVENT_URL   = String("http://") + BACKEND_IP + ":" + BACKEND_PORT + "/event";
+  COMMAND_URL = String("http://") + BACKEND_IP + ":" + BACKEND_PORT + "/device/" + DEVICE_ID + "/command";
+
+  Serial.println("EVENT_URL:   " + EVENT_URL);
+  Serial.println("COMMAND_URL: " + COMMAND_URL);
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected: " + WiFi.localIP().toString());
+}
+
+// ---------------- MPU ----------------
+void readMPU() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 6, true);
+
+  ax = (Wire.read() << 8 | Wire.read()) / 16384.0;
+  ay = (Wire.read() << 8 | Wire.read()) / 16384.0;
+  az = (Wire.read() << 8 | Wire.read()) / 16384.0;
+}
+
+// ---------------- IMPACT ----------------
+float getImpact() {
+  float g   = sqrt(ax * ax + ay * ay + az * az);
+  float raw = fabs(g - 1.0) * 5.0;
+  filteredImpact = 0.8 * filteredImpact + 0.2 * raw;
+  return filteredImpact;
+}
+
+// ---------------- ANGLES ----------------
+void getAngles(float &pitch, float &roll) {
+  pitch = atan2(ax, sqrt(ay * ay + az * az)) * 180 / PI;
+  roll  = atan2(ay, sqrt(ax * ax + az * az)) * 180 / PI;
+}
+
+// ---------------- SEND EVENT ----------------
+void sendEvent(float impact, float speed, float lat, float lon) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  http.begin(EVENT_URL);
+  http.addHeader("Content-Type", "application/json");
+
+  String payload = "{";
+  payload += "\"impact\":"  + String(impact, 2) + ",";
+  payload += "\"speed\":"   + String(speed,  2) + ",";
+  payload += "\"lat\":"     + String(lat,    6) + ",";
+  payload += "\"lon\":"     + String(lon,    6);
+  payload += "}";
+
+  int code = http.POST(payload);
+  Serial.print("Event POST => "); Serial.println(code);
+  http.end();
+}
+
+// ---------------- COMMAND POLLING ----------------
+void checkCommand() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+  http.begin(COMMAND_URL);
+
+  int code = http.GET();
+  if (code == 200) {
+    String res = http.getString();
+    Serial.print("Command: "); Serial.println(res);
+
+    if (res.indexOf("ALERT") >= 0 || res.indexOf("EMERGENCY") >= 0) triggerAlert();
+    if (res.indexOf("STOP")  >= 0 || res.indexOf("CANCEL")    >= 0) resetSystem();
+  }
+  http.end();
+}
+
+// ---------------- ALERT ----------------
+void triggerAlert() {
+  alertActive = true;
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(RED_LED,   HIGH);
+  tone(BUZZER, 2000);
+  Serial.println("ALERT TRIGGERED");
+}
+
+// ---------------- RESET ----------------
+void resetSystem() {
+  alertActive    = false;
+  waitingBackend = false;
+  digitalWrite(GREEN_LED, HIGH);
+  digitalWrite(RED_LED,   LOW);
+  noTone(BUZZER);
+  Serial.println("RESET");
+}
+
+// ---------------- LOOP ----------------
+void loop() {
+  while (gpsSerial.available()) gps.encode(gpsSerial.read());
+
+  float speed = gps.speed.isValid()    ? gps.speed.kmph()    : 0;
+  float lat   = gps.location.isValid() ? gps.location.lat()  : 0;
+  float lon   = gps.location.isValid() ? gps.location.lng()  : 0;
+
+  readMPU();
+  float impact = getImpact();
+
+  float pitch, roll;
+  getAngles(pitch, roll);
+
+  // -------- ROLLOVER DETECTION --------
+  if (abs(pitch) > 60 || abs(roll) > 60) rolloverCount++;
+  else rolloverCount = 0;
+
+  if (rolloverCount >= 3 && !alertActive) triggerAlert();
+
+  // -------- IMPACT DETECTION --------
+  if (!alertActive && impact > 20) {
+    if (WiFi.status() == WL_CONNECTED) {
+      sendEvent(impact, speed, lat, lon);
+      waitingBackend = true;
+      eventTime = millis();
+    } else {
+      triggerAlert(); // offline fallback
     }
   }
-  delay(300);
+
+  // -------- BACKEND TIMEOUT --------
+  if (waitingBackend && millis() - eventTime > 5000) {
+    triggerAlert();
+    waitingBackend = false;
+  }
+
+  // -------- COMMAND POLL --------
+  checkCommand();
+
+  // -------- BUTTON CANCEL --------
+  if (alertActive && digitalRead(BUTTON) == LOW) {
+    resetSystem();
+    delay(300);
+  }
+
+  delay(200);
 }
