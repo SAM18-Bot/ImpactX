@@ -16,55 +16,73 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="ImpactX Emergency Response", version="1.1.0")
+app = FastAPI(title="ImpactX Emergency Response", version="1.2.0")
 
-LOG_FILE = Path("events_log.jsonl")
+LOG_FILE      = Path("events_log.jsonl")
 LEARNING_FILE = Path("learning_profile.json")
+
 CONFIRMATION_SECONDS = 20
 
 
+# ─────────────────────────────────────────────
+# Models
+# ─────────────────────────────────────────────
+
 class SensorEvent(BaseModel):
-    impact: float = Field(..., ge=0, le=50)
-    tilt: float = Field(..., ge=0, le=180)
-    speed: float = Field(..., ge=0, le=300)
-    lat: float = Field(..., ge=-90, le=90)
-    lon: float = Field(..., ge=-180, le=180)
-    timestamp: datetime
+    impact:    float = Field(..., ge=0, le=50)
+    speed:     float = Field(..., ge=0, le=300)
+    lat:       float = Field(..., ge=-90,  le=90)
+    lon:       float = Field(..., ge=-180, le=180)
+    # tilt and timestamp are optional — ESP32 doesn't send them
+    tilt:      float = Field(default=0.0, ge=0, le=180)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 @dataclass
 class AgentActivity:
-    agent: str
+    agent:   str
     message: str
-    ts: str
+    ts:      str
 
 
 class EventResult(BaseModel):
-    event_id: int
-    status: Literal["SAFE", "ALERT", "EMERGENCY", "PENDING_CONFIRMATION", "CANCELLED"]
-    score: float
-    hospital: dict[str, Any] | None = None
+    event_id:     int
+    status:       Literal["SAFE", "ALERT", "EMERGENCY", "PENDING_CONFIRMATION", "CANCELLED"]
+    score:        float
+    hospital:     dict[str, Any] | None = None
     location_link: str
-    created_at: str
-    activities: list[dict[str, str]]
+    created_at:   str
+    activities:   list[dict[str, str]]
 
 
 class DeviceReport(BaseModel):
-    device_id: str
-    connected: bool = True
-    event_id: int | None = None
+    device_id:   str
+    connected:   bool = True
+    event_id:    int | None = None
     false_alarm: bool = False
 
 
+# ─────────────────────────────────────────────
+# In-memory state
+# ─────────────────────────────────────────────
+
 state: dict[str, Any] = {
-    "latest": None,
-    "logs": [],
+    "latest":     None,
+    "logs":       [],
     "activities": [],
-    "next_id": 1,
-    "learning": {"false_alarm_count": 0, "confirmed_count": 0, "threshold_shift": 0.0},
+    "next_id":    1,
+    "learning":   {
+        "false_alarm_count":  0,
+        "confirmed_count":    0,
+        "threshold_shift":    0.0,
+    },
     "devices": {},
 }
 
+
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -73,7 +91,6 @@ def utc_now() -> str:
 def add_activity(agent: str, message: str) -> AgentActivity:
     activity = AgentActivity(agent=agent, message=message, ts=utc_now())
     state["activities"].append(asdict(activity))
-    # Keep recent activity only for dashboard readability
     state["activities"] = state["activities"][-50:]
     return activity
 
@@ -87,8 +104,8 @@ def _load_learning_profile() -> None:
             state["learning"].update(
                 {
                     "false_alarm_count": int(data.get("false_alarm_count", 0)),
-                    "confirmed_count": int(data.get("confirmed_count", 0)),
-                    "threshold_shift": float(data.get("threshold_shift", 0.0)),
+                    "confirmed_count":   int(data.get("confirmed_count",   0)),
+                    "threshold_shift":   float(data.get("threshold_shift", 0.0)),
                 }
             )
     except Exception as exc:
@@ -106,91 +123,81 @@ def _update_learning(cancelled: bool) -> None:
         state["learning"]["confirmed_count"] += 1
 
     false_alarms = state["learning"]["false_alarm_count"]
-    confirmed = state["learning"]["confirmed_count"]
-    total = max(false_alarms + confirmed, 1)
+    confirmed    = state["learning"]["confirmed_count"]
+    total        = max(false_alarms + confirmed, 1)
     false_alarm_rate = false_alarms / total
 
-    # Online threshold adaptation:
-    # More false alarms => increase threshold slightly.
-    # Strong confirmations => reduce threshold slightly.
     shift = round(max(-6.0, min(12.0, (false_alarm_rate - 0.25) * 20.0)), 2)
     state["learning"]["threshold_shift"] = shift
     _save_learning_profile()
     add_activity(
         "Learning Agent",
-        f"Adaptive threshold shift updated to {shift:+.2f} (false alarm rate={false_alarm_rate:.2%})",
+        f"Adaptive threshold shift updated to {shift:+.2f} "
+        f"(false alarm rate={false_alarm_rate:.2%})",
     )
 
 
-# -----------------------------
-# Agent implementations
-# -----------------------------
-def perception_agent(raw: SensorEvent) -> dict[str, Any]:
-    normalized_speed = min(raw.speed / 120.0, 1.0)
-    normalized_impact = min(raw.impact / 10.0, 1.0)
-    normalized_tilt = min(raw.tilt / 90.0, 1.0)
+# ─────────────────────────────────────────────
+# Agents
+# ─────────────────────────────────────────────
 
+def perception_agent(raw: SensorEvent) -> dict[str, Any]:
     cleaned = {
-        "impact": raw.impact,
-        "tilt": raw.tilt,
-        "speed": raw.speed,
-        "lat": round(raw.lat, 6),
-        "lon": round(raw.lon, 6),
+        "impact":    raw.impact,
+        "tilt":      raw.tilt,
+        "speed":     raw.speed,
+        "lat":       round(raw.lat, 6),
+        "lon":       round(raw.lon, 6),
         "timestamp": raw.timestamp.astimezone(timezone.utc).isoformat(),
         "norm": {
-            "impact": round(normalized_impact, 3),
-            "speed": round(normalized_speed, 3),
-            "tilt": round(normalized_tilt, 3),
+            "impact": round(min(raw.impact / 10.0, 1.0), 3),
+            "speed":  round(min(raw.speed  / 120.0, 1.0), 3),
+            "tilt":   round(min(raw.tilt   / 90.0,  1.0), 3),
         },
     }
-    add_activity("Perception Agent", "Data received and normalized")
+    add_activity("Perception Agent", "Data received and normalised")
     return cleaned
 
 
 def calculate_severity(event: dict[str, Any]) -> tuple[float, str]:
-    # Real-world oriented risk formula:
-    # - impact dominates (sudden g-force)
-    # - speed contributes kinetic risk (normalized)
-    # - tilt indicates rollover likelihood
-    # - low speed + high impact often means pothole/phone drop (false alarm control)
     impact_score = min(100.0, event["impact"] * 6.5)
-    speed_score = min(100.0, (event["speed"] / 140.0) * 100.0)
-    tilt_score = min(100.0, (event["tilt"] / 90.0) * 100.0)
+    speed_score  = min(100.0, (event["speed"] / 140.0) * 100.0)
+    tilt_score   = min(100.0, (event["tilt"]  / 90.0)  * 100.0)
 
     score = (impact_score * 0.55) + (speed_score * 0.30) + (tilt_score * 0.15)
+
+    # Low-speed low-impact suppression (pothole / phone-drop false alarms)
     if event["speed"] < 12 and event["impact"] < 7:
         score *= 0.65
 
-    shift = float(state["learning"].get("threshold_shift", 0.0))
-    alert_threshold = 20 + shift
+    shift              = float(state["learning"].get("threshold_shift", 0.0))
+    alert_threshold    = 20 + shift
     emergency_threshold = 50 + shift
+
     if score < alert_threshold:
         status = "SAFE"
     elif score <= emergency_threshold:
         status = "ALERT"
     else:
         status = "EMERGENCY"
+
     add_activity(
         "Decision Agent",
-        (
-            f"Score={score:.2f}, status={status}, "
-            f"thresholds(alert={alert_threshold:.2f}, emergency={emergency_threshold:.2f})"
-        ),
+        f"Score={score:.2f}, status={status}, "
+        f"thresholds(alert={alert_threshold:.2f}, emergency={emergency_threshold:.2f})",
     )
     return round(score, 2), status
 
 
 def coordination_agent(lat: float, lon: float) -> dict[str, Any]:
-    # Mock hospitals around Pune coordinates for demo purposes.
     hospitals = [
-        {"name": "City Hospital", "lat": 18.530, "lon": 73.850},
+        {"name": "City Hospital",          "lat": 18.530, "lon": 73.850},
         {"name": "General Medical Center", "lat": 18.515, "lon": 73.870},
-        {"name": "Sunrise Trauma Care", "lat": 18.525, "lon": 73.840},
+        {"name": "Sunrise Trauma Care",    "lat": 18.525, "lon": 73.840},
     ]
 
     def dist_km(a_lat: float, a_lon: float, b_lat: float, b_lon: float) -> float:
-        # quick Haversine
-        r = 6371
+        r    = 6371
         dlat = math.radians(b_lat - a_lat)
         dlon = math.radians(b_lon - a_lon)
         x = (
@@ -201,15 +208,9 @@ def coordination_agent(lat: float, lon: float) -> dict[str, Any]:
         )
         return r * 2 * math.atan2(math.sqrt(x), math.sqrt(1 - x))
 
-    closest = min(
-        hospitals,
-        key=lambda h: dist_km(lat, lon, h["lat"], h["lon"]),
-    )
+    closest  = min(hospitals, key=lambda h: dist_km(lat, lon, h["lat"], h["lon"]))
     distance = dist_km(lat, lon, closest["lat"], closest["lon"])
-    result = {
-        "hospital": closest["name"],
-        "distance": f"{distance:.2f} km",
-    }
+    result   = {"hospital": closest["name"], "distance": f"{distance:.2f} km"}
     add_activity("Coordination Agent", f"Nearest hospital: {result['hospital']} ({result['distance']})")
     return result
 
@@ -219,10 +220,11 @@ def communication_agent(lat: float, lon: float, status: str) -> str:
         f"Accident detected! Status: {status}. "
         f"Location: https://maps.google.com/?q={lat},{lon}"
     )
-    sms_ok = send_sms(msg)
+    sms_ok  = send_sms(msg)
     call_ok = False
     if status == "EMERGENCY":
         call_ok = make_emergency_call(lat, lon)
+
     mode = "real" if sms_ok or call_ok else "simulated"
     add_activity("Communication Agent", f"Alert sent ({mode}; sms={sms_ok}, call={call_ok})")
     return msg
@@ -243,29 +245,29 @@ def queue_device_command(command: str, event_id: int | None = None) -> None:
         add_activity("Coordination Agent", f"Queued '{command}' for device {device_id}")
 
 
+# ─────────────────────────────────────────────
+# Twilio helpers
+# ─────────────────────────────────────────────
+
 def _twilio_env_ready() -> bool:
-    required = [
-        "TWILIO_ACCOUNT_SID",
-        "TWILIO_AUTH_TOKEN",
-        "TWILIO_FROM_NUMBER",
-        "EMERGENCY_TO_NUMBER",
-    ]
-    return os.getenv("ENABLE_REAL_COMMUNICATION", "false").lower() == "true" and all(os.getenv(k) for k in required)
+    required = ["TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER", "EMERGENCY_TO_NUMBER"]
+    return (
+        os.getenv("ENABLE_REAL_COMMUNICATION", "false").lower() == "true"
+        and all(os.getenv(k) for k in required)
+    )
 
 
 def _twilio_post(path: str, data: dict[str, str]) -> bool:
-    sid = os.getenv("TWILIO_ACCOUNT_SID", "")
-    token = os.getenv("TWILIO_AUTH_TOKEN", "")
+    import base64
+    sid     = os.getenv("TWILIO_ACCOUNT_SID", "")
+    token   = os.getenv("TWILIO_AUTH_TOKEN", "")
     payload = urlencode(data).encode("utf-8")
-    req = Request(
+    req     = Request(
         f"https://api.twilio.com/2010-04-01/Accounts/{sid}/{path}.json",
-        data=payload,
-        method="POST",
+        data=payload, method="POST",
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
-    import base64
-
-    auth = base64.b64encode(f"{sid}:{token}".encode("utf-8")).decode("utf-8")
+    auth = base64.b64encode(f"{sid}:{token}".encode()).decode()
     req.add_header("Authorization", f"Basic {auth}")
     try:
         with urlopen(req, timeout=10) as resp:
@@ -281,11 +283,9 @@ def send_sms(message: str) -> bool:
         return False
     return _twilio_post(
         "Messages",
-        {
-            "From": os.getenv("TWILIO_FROM_NUMBER", ""),
-            "To": os.getenv("EMERGENCY_TO_NUMBER", ""),
-            "Body": message,
-        },
+        {"From": os.getenv("TWILIO_FROM_NUMBER", ""),
+         "To":   os.getenv("EMERGENCY_TO_NUMBER", ""),
+         "Body": message},
     )
 
 
@@ -296,45 +296,48 @@ def make_emergency_call(lat: float, lon: float) -> bool:
     twiml_url = os.getenv("TWILIO_TWIML_URL", "http://demo.twilio.com/docs/voice.xml")
     return _twilio_post(
         "Calls",
-        {
-            "From": os.getenv("TWILIO_FROM_NUMBER", ""),
-            "To": os.getenv("EMERGENCY_TO_NUMBER", ""),
-            "Url": twiml_url,
-        },
+        {"From": os.getenv("TWILIO_FROM_NUMBER", ""),
+         "To":   os.getenv("EMERGENCY_TO_NUMBER", ""),
+         "Url":  twiml_url},
     )
 
 
+# ─────────────────────────────────────────────
+# Core async event pipeline
+# ─────────────────────────────────────────────
+
 async def finalize_event_after_countdown(
     event_id: int,
-    event: dict[str, Any],
-    score: float,
+    event:    dict[str, Any],
+    score:    float,
     tentative: str,
 ) -> None:
-    add_activity("Decision Agent", f"Waiting {CONFIRMATION_SECONDS} seconds for user override (event {event_id})")
+    add_activity("Decision Agent", f"Waiting {CONFIRMATION_SECONDS}s for cancel (event {event_id})")
     await asyncio.sleep(CONFIRMATION_SECONDS)
 
     latest = state.get("latest")
     if not latest or latest.get("event_id") != event_id:
         return
     if latest.get("status") == "CANCELLED":
-        add_activity("Decision Agent", f"Event {event_id} was cancelled by user")
+        add_activity("Decision Agent", f"Event {event_id} cancelled by user")
         return
 
     final_status = tentative
     hospital = None
+
     if final_status in {"ALERT", "EMERGENCY"}:
         hospital = coordination_agent(event["lat"], event["lon"])
         communication_agent(event["lat"], event["lon"], final_status)
         queue_device_command(final_status, event_id=event_id)
 
     result = {
-        "event_id": event_id,
-        "status": final_status,
-        "score": score,
-        "hospital": hospital,
+        "event_id":      event_id,
+        "status":        final_status,
+        "score":         score,
+        "hospital":      hospital,
         "location_link": f"https://maps.google.com/?q={event['lat']},{event['lon']}",
-        "created_at": utc_now(),
-        "activities": list(state["activities"]),
+        "created_at":    utc_now(),
+        "activities":    list(state["activities"]),
     }
     state["latest"] = result
     state["logs"].append(result)
@@ -343,13 +346,13 @@ async def finalize_event_after_countdown(
 
 
 async def _process_sensor_event(sensor_event: SensorEvent) -> EventResult:
-    event = perception_agent(sensor_event)
+    event        = perception_agent(sensor_event)
     score, status = calculate_severity(event)
 
-    event_id = state["next_id"]
+    event_id         = state["next_id"]
     state["next_id"] += 1
 
-    pending_status: EventResult = EventResult(
+    pending = EventResult(
         event_id=event_id,
         status="PENDING_CONFIRMATION" if status in {"ALERT", "EMERGENCY"} else "SAFE",
         score=score,
@@ -359,10 +362,10 @@ async def _process_sensor_event(sensor_event: SensorEvent) -> EventResult:
         activities=list(state["activities"]),
     )
 
-    state["latest"] = pending_status.model_dump()
+    state["latest"] = pending.model_dump()
 
     if status == "SAFE":
-        safe_record = pending_status.model_dump()
+        safe_record = pending.model_dump()
         safe_record["status"] = "SAFE"
         state["latest"] = safe_record
         state["logs"].append(safe_record)
@@ -370,11 +373,20 @@ async def _process_sensor_event(sensor_event: SensorEvent) -> EventResult:
         return EventResult(**safe_record)
 
     asyncio.create_task(finalize_event_after_countdown(event_id, event, score, status))
-    return pending_status
+    return pending
 
+
+# ─────────────────────────────────────────────
+# API routes
+# ─────────────────────────────────────────────
 
 @app.post("/event", response_model=EventResult)
 async def ingest_event(sensor_event: SensorEvent):
+    """
+    Accepts telemetry from ESP32.
+    Required fields: impact, speed, lat, lon
+    Optional fields: tilt (default 0), timestamp (default now)
+    """
     return await _process_sensor_event(sensor_event)
 
 
@@ -398,19 +410,24 @@ async def cancel_event(event_id: int):
 def device_report(report: DeviceReport):
     device = state["devices"].setdefault(
         report.device_id,
-        {"connected": False, "last_seen": None, "command": {"command": "NONE", "event_id": None, "ts": utc_now()}},
+        {"connected": False, "last_seen": None,
+         "command": {"command": "NONE", "event_id": None, "ts": utc_now()}},
     )
     device["connected"] = report.connected
     device["last_seen"] = utc_now()
+
     if report.false_alarm and report.event_id is not None:
         latest = state.get("latest")
-        if latest and latest.get("event_id") == report.event_id and latest.get("status") == "PENDING_CONFIRMATION":
+        if (latest
+                and latest.get("event_id") == report.event_id
+                and latest.get("status") == "PENDING_CONFIRMATION"):
             latest["status"] = "CANCELLED"
             state["logs"].append(dict(latest))
             learning_agent(dict(latest))
             _update_learning(cancelled=True)
             device["command"] = {"command": "CANCEL", "event_id": report.event_id, "ts": utc_now()}
-            add_activity("Perception Agent", f"Hardware false alarm cancel from {report.device_id}")
+            add_activity("Perception Agent", f"Hardware false-alarm cancel from {report.device_id}")
+
     return {"ok": True}
 
 
@@ -418,7 +435,8 @@ def device_report(report: DeviceReport):
 def get_device_command(device_id: str):
     device = state["devices"].setdefault(
         device_id,
-        {"connected": True, "last_seen": utc_now(), "command": {"command": "NONE", "event_id": None, "ts": utc_now()}},
+        {"connected": True, "last_seen": utc_now(),
+         "command": {"command": "NONE", "event_id": None, "ts": utc_now()}},
     )
     device["connected"] = True
     device["last_seen"] = utc_now()
@@ -429,17 +447,18 @@ def get_device_command(device_id: str):
 def ack_device_command(device_id: str):
     device = state["devices"].setdefault(
         device_id,
-        {"connected": True, "last_seen": utc_now(), "command": {"command": "NONE", "event_id": None, "ts": utc_now()}},
+        {"connected": True, "last_seen": utc_now(),
+         "command": {"command": "NONE", "event_id": None, "ts": utc_now()}},
     )
-    device["command"] = {"command": "NONE", "event_id": None, "ts": utc_now()}
-    device["last_seen"] = utc_now()
+    device["command"]    = {"command": "NONE", "event_id": None, "ts": utc_now()}
+    device["last_seen"]  = utc_now()
     return {"ok": True}
 
 
 @app.get("/status")
 def get_status():
     return {
-        "latest": state.get("latest"),
+        "latest":   state.get("latest"),
         "activity": state.get("activities", [])[-10:],
     }
 
@@ -454,6 +473,10 @@ def health():
     return {"ok": True, "time": utc_now()}
 
 
+# ─────────────────────────────────────────────
+# Static files + dashboard
+# ─────────────────────────────────────────────
+
 if Path("static").exists():
     app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -463,7 +486,11 @@ def dashboard():
     dashboard_file = Path("static/index.html")
     if dashboard_file.exists():
         return dashboard_file.read_text(encoding="utf-8")
-    return "<h1>ImpactX Dashboard not found</h1>"
+    return "<h1>ImpactX Dashboard — place static/index.html to enable</h1>"
 
+
+# ─────────────────────────────────────────────
+# Startup
+# ─────────────────────────────────────────────
 
 _load_learning_profile()
