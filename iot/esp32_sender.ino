@@ -3,18 +3,11 @@
 #include <Wire.h>
 #include <TinyGPSPlus.h>
 
-// ---------------- CONFIG ----------------
-const char* ssid     = "GT20";
+// ---------------- WIFI ----------------
+const char* ssid = "GT20";
 const char* password = "12345678";
 
-// ⬇ Set this to your PC's local IP (run `ipconfig` on Windows / `ip a` on Linux)
-const char* BACKEND_IP = "IP";
-const int   BACKEND_PORT = 8000;
-const char* DEVICE_ID    = "esp32-001"; // unique ID for your device
-
-// Derived URLs
-String EVENT_URL;
-String COMMAND_URL;
+const char* EVENT_URL = "IP";
 
 // ---------------- MPU ----------------
 const int MPU_ADDR = 0x68;
@@ -22,56 +15,53 @@ float ax, ay, az;
 
 // ---------------- GPS ----------------
 TinyGPSPlus gps;
-HardwareSerial gpsSerial(1);
+HardwareSerial gpsSerial(0); // U0R/U0T
 
 // ---------------- PINS ----------------
-#define GREEN_LED 33
-#define RED_LED    2
-#define BUZZER    26
-#define BUTTON     4
+#define GREEN_LED 12
+#define RED_LED   4
+#define BUZZER    2
+#define BUTTON    13
 
 // ---------------- STATE ----------------
-bool alertActive    = false;
-bool waitingBackend = false;
-unsigned long eventTime = 0;
+bool alertActive = false;
+bool eventSent = false;
+
+unsigned long alertStart = 0;
+const unsigned long CANCEL_TIME = 20000;
 
 // ---------------- FILTER ----------------
 float filteredImpact = 0;
-int   rolloverCount  = 0;
 
 // ---------------- SETUP ----------------
 void setup() {
   Serial.begin(115200);
 
   pinMode(GREEN_LED, OUTPUT);
-  pinMode(RED_LED,   OUTPUT);
-  pinMode(BUZZER,    OUTPUT);
-  pinMode(BUTTON,    INPUT_PULLUP);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(BUZZER, OUTPUT);
+  pinMode(BUTTON, INPUT_PULLUP);
 
   digitalWrite(GREEN_LED, HIGH);
 
   Wire.begin(14, 15);
+
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x6B);
   Wire.write(0);
   Wire.endTransmission(true);
 
-  gpsSerial.begin(9600, SERIAL_8N1, 16, 17);
-
-  // Build URLs at runtime
-  EVENT_URL   = String("http://") + BACKEND_IP + ":" + BACKEND_PORT + "/event";
-  COMMAND_URL = String("http://") + BACKEND_IP + ":" + BACKEND_PORT + "/device/" + DEVICE_ID + "/command";
-
-  Serial.println("EVENT_URL:   " + EVENT_URL);
-  Serial.println("COMMAND_URL: " + COMMAND_URL);
+  gpsSerial.begin(9600);
 
   WiFi.begin(ssid, password);
-  Serial.print("Connecting to WiFi");
+
+  Serial.print("Connecting WiFi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\nWiFi connected: " + WiFi.localIP().toString());
+
+  Serial.println("\nConnected!");
 }
 
 // ---------------- MPU ----------------
@@ -88,119 +78,113 @@ void readMPU() {
 
 // ---------------- IMPACT ----------------
 float getImpact() {
-  float g   = sqrt(ax * ax + ay * ay + az * az);
-  float raw = fabs(g - 1.0) * 5.0;
-  filteredImpact = 0.8 * filteredImpact + 0.2 * raw;
+  float g = sqrt(ax * ax + ay * ay + az * az);
+
+  // 🔥 FIXED SCALING
+  float raw = fabs(g - 1.0) * 20.0;
+
+  filteredImpact = 0.7 * filteredImpact + 0.3 * raw;
+
   return filteredImpact;
 }
 
-// ---------------- ANGLES ----------------
-void getAngles(float &pitch, float &roll) {
-  pitch = atan2(ax, sqrt(ay * ay + az * az)) * 180 / PI;
-  roll  = atan2(ay, sqrt(ax * ax + az * az)) * 180 / PI;
-}
+// ---------------- SEND ----------------
+void sendEvent(float impact, float lat, float lon) {
 
-// ---------------- SEND EVENT ----------------
-void sendEvent(float impact, float speed, float lat, float lon) {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ WiFi not connected");
+    return;
+  }
+
+  Serial.println("🚀 Sending to backend...");
 
   HTTPClient http;
   http.begin(EVENT_URL);
   http.addHeader("Content-Type", "application/json");
 
+  http.setTimeout(3000);
+  http.useHTTP10(true);
+
+  // 🔥 FIXED PAYLOAD
   String payload = "{";
-  payload += "\"impact\":"  + String(impact, 2) + ",";
-  payload += "\"speed\":"   + String(speed,  2) + ",";
-  payload += "\"lat\":"     + String(lat,    6) + ",";
-  payload += "\"lon\":"     + String(lon,    6);
+  payload += "\"impact\":" + String(impact,2) + ",";
+  payload += "\"speed\":0,";
+  payload += "\"lat\":" + String(lat,6) + ",";
+  payload += "\"lon\":" + String(lon,6) + ",";
+  payload += "\"timestamp\":\"2026-01-01T00:00:00Z\"";
   payload += "}";
 
   int code = http.POST(payload);
-  Serial.print("Event POST => "); Serial.println(code);
-  http.end();
-}
 
-// ---------------- COMMAND POLLING ----------------
-void checkCommand() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  Serial.print("POST Code: ");
+  Serial.println(code);
 
-  HTTPClient http;
-  http.begin(COMMAND_URL);
-
-  int code = http.GET();
-  if (code == 200) {
-    String res = http.getString();
-    Serial.print("Command: "); Serial.println(res);
-
-    if (res.indexOf("ALERT") >= 0 || res.indexOf("EMERGENCY") >= 0) triggerAlert();
-    if (res.indexOf("STOP")  >= 0 || res.indexOf("CANCEL")    >= 0) resetSystem();
-  }
   http.end();
 }
 
 // ---------------- ALERT ----------------
 void triggerAlert() {
   alertActive = true;
+  eventSent = false;
+  alertStart = millis();
+
   digitalWrite(GREEN_LED, LOW);
-  digitalWrite(RED_LED,   HIGH);
+  digitalWrite(RED_LED, HIGH);
   tone(BUZZER, 2000);
-  Serial.println("ALERT TRIGGERED");
+
+  Serial.println("🚨 ALERT TRIGGERED");
 }
 
 // ---------------- RESET ----------------
 void resetSystem() {
-  alertActive    = false;
-  waitingBackend = false;
+  alertActive = false;
+  eventSent = false;
+
   digitalWrite(GREEN_LED, HIGH);
-  digitalWrite(RED_LED,   LOW);
+  digitalWrite(RED_LED, LOW);
   noTone(BUZZER);
-  Serial.println("RESET");
+
+  Serial.println("✅ CANCELLED");
 }
 
 // ---------------- LOOP ----------------
 void loop() {
+
   while (gpsSerial.available()) gps.encode(gpsSerial.read());
 
-  float speed = gps.speed.isValid()    ? gps.speed.kmph()    : 0;
-  float lat   = gps.location.isValid() ? gps.location.lat()  : 0;
-  float lon   = gps.location.isValid() ? gps.location.lng()  : 0;
+  float lat = gps.location.isValid() ? gps.location.lat() : 0;
+  float lon = gps.location.isValid() ? gps.location.lng() : 0;
 
   readMPU();
+
   float impact = getImpact();
 
-  float pitch, roll;
-  getAngles(pitch, roll);
-
-  // -------- ROLLOVER DETECTION --------
-  if (abs(pitch) > 60 || abs(roll) > 60) rolloverCount++;
-  else rolloverCount = 0;
-
-  if (rolloverCount >= 3 && !alertActive) triggerAlert();
+  // 🔍 DEBUG PRINT
+  Serial.println("Impact: " + String(impact));
 
   // -------- IMPACT DETECTION --------
   if (!alertActive && impact > 20) {
-    if (WiFi.status() == WL_CONNECTED) {
-      sendEvent(impact, speed, lat, lon);
-      waitingBackend = true;
-      eventTime = millis();
-    } else {
-      triggerAlert(); // offline fallback
-    }
-  }
-
-  // -------- BACKEND TIMEOUT --------
-  if (waitingBackend && millis() - eventTime > 5000) {
     triggerAlert();
-    waitingBackend = false;
   }
 
-  // -------- COMMAND POLL --------
-  checkCommand();
+  // -------- SEND EVENT --------
+  if (alertActive && !eventSent) {
+    sendEvent(impact, lat, lon);
+    eventSent = true;
+  }
 
-  // -------- BUTTON CANCEL --------
-  if (alertActive && digitalRead(BUTTON) == LOW) {
-    resetSystem();
-    delay(300);
+  // -------- CANCEL WINDOW --------
+  if (alertActive) {
+
+    if (digitalRead(BUTTON) == LOW) {
+      resetSystem();
+      delay(300);
+      return;
+    }
+
+    if (millis() - alertStart > CANCEL_TIME) {
+      Serial.println("⏱️ Window ended");
+    }
   }
 
   delay(200);
